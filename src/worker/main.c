@@ -1,6 +1,7 @@
 #include "diskscope/ds_session.h"
 #include "diskscope/ds_store.h"
 #include "local.h"
+#include "cache_lease.h"
 #include "protocol.h"
 
 #include <errno.h>
@@ -28,6 +29,7 @@ typedef struct {
     int64_t sequence;
     DsStore *store;
     char *cache;
+    DsCacheLease *lease;
     uint64_t cache_budget;
     int64_t commit_seq, observations, reported_at, reported_seq;
 } Worker;
@@ -164,6 +166,14 @@ static void lower_priority(void)
 #endif
 }
 
+static DsStatus capture_volume(const DsVolumeInfo *volume, void *data, DsError *error)
+{
+    Worker *worker = data;
+    if (ds_control_canceled(&worker->control))
+        return DS_CANCELED;
+    return ds_store_set_volume(worker->store, volume, error);
+}
+
 static DsStatus process(Worker *worker, DsScanOptions *options, DsError *error)
 {
     worker->cache = ds_path_arg(&options->cache_path, error);
@@ -172,7 +182,14 @@ static DsStatus process(Worker *worker, DsScanOptions *options, DsError *error)
     if (!g_path_is_absolute(worker->cache) || !capacity(worker))
         return ds_error(error, DS_LIMIT, 0, "Insufficient space in the private cache");
 
+    worker->lease = ds_cache_lease_open(worker->cache, false, false, error);
+    if (!worker->lease)
+        return error->status;
     char *database = g_build_filename(worker->cache, "scan.sqlite", NULL);
+    if (g_file_test(database, G_FILE_TEST_EXISTS | G_FILE_TEST_IS_SYMLINK)) {
+        g_free(database);
+        return ds_error(error, DS_INVALID, 0, "A scan worker requires an unused cache");
+    }
     DsNativePath path = {0};
     DsStatus status = ds_path_from_arg(database, &path, error);
     if (status == DS_OK)
@@ -191,6 +208,8 @@ static DsStatus process(Worker *worker, DsScanOptions *options, DsError *error)
     /* Ignore all DiskScope artifacts under the configured cache base. */
     DsScanOptions walk = *options;
     walk.cache_path = (DsNativePath){0};
+    walk.volume_sink = capture_volume;
+    walk.volume_data = worker;
     char *cache_base = g_path_get_dirname(worker->cache);
     status = ds_path_from_arg(cache_base, &walk.cache_path, error);
     g_free(cache_base);
@@ -327,6 +346,7 @@ int main(void)
         g_free(summary);
         g_free(log_path);
     }
+    /* The OS releases the worker cache lease at process exit. */
     g_free(worker.cache);
     /* stdout was flushed. A blocked command read must not hold stdio shutdown. */
     _Exit(ok ? 0 : 5);

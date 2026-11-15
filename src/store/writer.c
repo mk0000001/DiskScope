@@ -19,6 +19,9 @@ static uint64_t file_size(const char *path)
 static uint64_t cache_size(DsStore *store, uint64_t database)
 {
     if (store->cache_directory) {
+#ifdef G_OS_WIN32
+        return ds_win_cache_usage(store->cache_directory);
+#else
         GDir *directory = g_dir_open(store->cache_directory, 0, NULL);
         if (!directory) return UINT64_MAX;
         uint64_t total = 0;
@@ -34,6 +37,7 @@ static uint64_t cache_size(DsStore *store, uint64_t database)
         }
         g_dir_close(directory);
         return total;
+#endif
     }
     char *wal = g_strconcat(store->filename, "-wal", NULL);
     char *shm = g_strconcat(store->filename, "-shm", NULL);
@@ -148,12 +152,17 @@ static char *managed_cache(DsStore *store, const DsNativePath *path)
     if (!path->raw) return NULL;
     char *arg = ds_path_arg(path, NULL);
     if (!arg) return NULL;
+#ifdef G_OS_WIN32
+    char *directory = ds_win_extended_path(arg);
+    char *parent = g_path_get_dirname(store->filename);
+#else
     char *directory = g_canonicalize_filename(arg, NULL);
     char *database = g_canonicalize_filename(store->filename, NULL);
     char *parent = g_path_get_dirname(database);
-    if (strcmp(directory, parent)) g_clear_pointer(&directory, g_free);
-    g_free(parent);
     g_free(database);
+#endif
+    if (g_strcmp0(directory, parent)) g_clear_pointer(&directory, g_free);
+    g_free(parent);
     g_free(arg);
     return directory;
 }

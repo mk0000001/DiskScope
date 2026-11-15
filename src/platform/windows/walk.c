@@ -196,15 +196,20 @@ static DsStatus inspect_root(Walker *w)
         w->path[end] = 0;
         HANDLE handle = INVALID_HANDLE_VALUE;
         DsWinNode node;
+        DsVolumeInfo volume;
         DWORD error = open_directory(w->path, &handle, &node);
         w->path[end] = saved;
         if (!error && !saved) {
-            DsWinVolume volume;
-            error = ds_win_volume_info(handle, w->path, &volume);
-            if (!error && !supported_filesystem(volume.filesystem)) error = ERROR_NOT_SUPPORTED;
-            if (!error) {
+            WCHAR filesystem[32];
+            if (!GetVolumeInformationByHandleW(handle, NULL, 0, NULL, NULL, NULL,
+                                              filesystem, G_N_ELEMENTS(filesystem))) {
+                error = GetLastError();
+            } else if (!supported_filesystem(filesystem)) {
+                error = ERROR_NOT_SUPPORTED;
+            } else {
                 w->root = node;
-                w->ntfs = wcscmp(volume.filesystem, L"NTFS") == 0;
+                w->ntfs = wcscmp(filesystem, L"NTFS") == 0;
+                if (w->options->volume_sink) volume = ds_win_volume_info(handle);
             }
         }
         if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
@@ -214,7 +219,11 @@ static DsStatus inspect_root(Walker *w)
             return ds_error(w->error, invalid ? DS_INVALID : DS_IO, error,
                             "Could not open the Windows scan root as a supported local directory");
         }
-        if (!saved) return DS_OK;
+        if (!saved) {
+            if (!ds_control_checkpoint(w->control)) return DS_CANCELED;
+            return w->options->volume_sink
+                ? w->options->volume_sink(&volume, w->options->volume_data, w->error) : DS_OK;
+        }
         if (saved == L'\\') ++end;
         while (w->path[end] && w->path[end] != L'\\') ++end;
     }

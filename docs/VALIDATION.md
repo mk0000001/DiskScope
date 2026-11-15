@@ -1,5 +1,19 @@
 # Validation and performance
 
+## 0.1.1 preview
+
+| Evidence | Result |
+|---|---|
+| Native Windows 11 x64 UCRT64 Release | 18/18 CTest groups PASS. Extracted portable CLI scanned an NTFS fixture with a 1,194 UTF-16-unit cache base and a Windows-system-only PATH. Default and Cairo GTK imports reopened private snapshots at 1,263 and 1,261 units respectively. All three SQLite snapshots passed quick_check. Windows long-path opt-in was disabled on the test host. |
+| Ubuntu 24.04.4 amd64 on WSL 1 | Release 18/18 and ASan/UBSan 18/18 CTest groups PASS. The native raw-filename subcase reports SKIP under WSL 1. |
+| X11 / headless Weston | Xvfb covered default GTK and Cairo. Headless Weston covered Wayland with Cairo at GDK scale 2. Startup recovery opened the committed cache with the original fixture directory moved. On WSL 1, the default Wayland EGL presentation path could fault in Mesa/Gallium. The application retains its default renderer and offers `--cairo`. |
+| Version compatibility and recovery | v1 snapshots opened, backed up and reopened with volume data absent. v2 malformed volume data was rejected. A distinct child process kept an active lease after the controller lease closed. A separate fixture left committed observations in a WAL on process exit and recovered them without reopening the original root. |
+| Export scope | Integration tests cover a selected file, nested folders, filtered matches across pagination, invalid and non-UTF-8 paths, cancellation and preservation of existing outputs. Both OSes ran CLI selected-ID export. |
+
+The clean Windows 11 VM, live cloud provider, desktop fractional scale and keyboard matrix, end-to-end GUI responsiveness, and specialized filesystems remain unmeasured.
+
+## 0.1.0 baseline
+
 DiskScope 0.1.0 preview, 2026-11-15. Fixtures were disposable directories and generated SQLite results. No whole-system-volume stress scan was performed.
 
 ## Environments

@@ -131,6 +131,12 @@ DsStatus ds_snapshot_open(const DsNativePath *path, DsStore **reader,
     if (ds_control_canceled(control)) return DS_CANCELED;
     char *filename = ds_path_arg(path, error);
     if (!filename) return DS_INVALID;
+#ifdef G_OS_WIN32
+    char *extended = ds_win_extended_path(filename);
+    g_free(filename);
+    filename = extended;
+    if (!filename) return ds_error(error, DS_INVALID, 0, "Invalid Windows snapshot path");
+#endif
     GStatBuf info;
     int present = g_stat(filename, &info);
     const char *const suffixes[] = {"-wal", "-shm", "-journal"};
@@ -161,6 +167,8 @@ DsStatus ds_snapshot_open(const DsNativePath *path, DsStore **reader,
     if (rc == SQLITE_OK && ds_store_info(store, &metadata, error) != DS_OK)
         rc = ds_control_canceled(control) ? SQLITE_INTERRUPT : SQLITE_CORRUPT;
     if (rc == SQLITE_OK) rc = validate_metadata(store, &metadata);
+    DsVolumeInfo volume;
+    if (rc == SQLITE_OK) rc = ds_store_read_volume(store, &volume);
     if (rc == SQLITE_OK) rc = validate_entries(store, &metadata);
     if (rc == SQLITE_OK) rc = validate_metrics(store);
     ds_store_info_clear(&metadata);

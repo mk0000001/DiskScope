@@ -161,11 +161,35 @@ static void selection_changed(GObject *model, GParamSpec *param, gpointer data)
     (void)param;
     View *v = data;
     const DsRow *row = model_row(gtk_single_selection_get_selected_item(GTK_SINGLE_SELECTION(model)));
+    v->export_selection = row ? row->entry.id : 0;
     if (row) {
         v->selected_kind = row->entry.kind;
         int64_t folder = row->entry.kind == DS_DIRECTORY ? row->entry.id : row->entry.parent_id;
         ui_details(v, row->entry.id, folder, row);
+    } else {
+        ui_controls(v);
     }
+}
+
+DsQuery ui_result_query(View *v, bool *tree)
+{
+    const char *text = gtk_editable_get_text(GTK_EDITABLE(v->search));
+    const char *ext = gtk_editable_get_text(GTK_EDITABLE(v->extension));
+    DsQuery query = {.parent_id=0, .filter=*text ? text : NULL, .search_path=true,
+                     .extension=*ext ? ext : NULL, .metric=ui_metric(v),
+                     .sort=DS_SORT_METRIC, .descending=true, .limit=DS_PAGE_MAX,
+                     .issues_only=v->mode == ISSUES};
+    query.has_min_bytes = parse_bytes(v->minimum, &query.min_bytes);
+    query.has_max_bytes = parse_bytes(v->maximum, &query.max_bytes);
+    query.has_mtime_from = parse_time(v->from, false, &query.mtime_from);
+    query.has_mtime_to = parse_time(v->to, true, &query.mtime_to);
+    *tree = v->mode == TREE && !query.filter && !query.extension && !query.has_min_bytes &&
+            !query.has_max_bytes && !query.has_mtime_from && !query.has_mtime_to;
+    if (!*tree) {
+        query.parent_id = DS_QUERY_ALL;
+        query.kind = v->mode == TOP_FILE ? DS_FILE : v->mode == TOP_DIR ? DS_DIRECTORY : 0;
+    }
+    return query;
 }
 
 void ui_refresh(View *v)
@@ -174,6 +198,7 @@ void ui_refresh(View *v)
     if (v->detail_task)
         g_cancellable_cancel(v->detail_task);
     v->selected = v->mapped_folder = 0;
+    v->export_selection = 0;
     v->selected_kind = 0;
     ds_details_clear(&v->detail);
     ui_label(v->path, "");
@@ -197,22 +222,8 @@ void ui_refresh(View *v)
         ui_launch(v, job);
         return;
     }
-    const char *text = gtk_editable_get_text(GTK_EDITABLE(v->search));
-    const char *ext = gtk_editable_get_text(GTK_EDITABLE(v->extension));
-    DsQuery q = {.parent_id=0, .filter=*text ? text : NULL, .search_path=true,
-                 .extension=*ext ? ext : NULL, .metric=ui_metric(v),
-                 .sort=DS_SORT_METRIC, .descending=true, .limit=DS_PAGE_MAX,
-                 .issues_only=v->mode == ISSUES};
-    q.has_min_bytes = parse_bytes(v->minimum, &q.min_bytes);
-    q.has_max_bytes = parse_bytes(v->maximum, &q.max_bytes);
-    q.has_mtime_from = parse_time(v->from, false, &q.mtime_from);
-    q.has_mtime_to = parse_time(v->to, true, &q.mtime_to);
-    bool tree = v->mode == TREE && !q.filter && !q.extension && !q.has_min_bytes &&
-                !q.has_max_bytes && !q.has_mtime_from && !q.has_mtime_to;
-    if (!tree) {
-        q.parent_id = DS_QUERY_ALL;
-        q.kind = v->mode == TOP_FILE ? DS_FILE : v->mode == TOP_DIR ? DS_DIRECTORY : 0;
-    }
+    bool tree;
+    DsQuery q = ui_result_query(v, &tree);
     v->base = ds_paged_model_new(&v->db, &q);
     if (v->mode == TOP_DIR || v->mode == TOP_FILE)
         ds_paged_model_set_cap(v->base, gtk_drop_down_get_selected(v->cap) ? 1000 : 100);
@@ -292,6 +303,7 @@ static void map_clicked(GtkGestureClick *click, int count, double x, double y, g
     int64_t id = ds_treemap_hit(v->layout, x, y);
     if (id <= 0)
         return;
+    v->export_selection = id;
     GListModel *model = G_LIST_MODEL(gtk_column_view_get_model(v->table));
     guint n = model ? MIN(g_list_model_get_n_items(model), 512u) : 0;
     for (guint i = 0; i < n; ++i) {
@@ -302,6 +314,7 @@ static void map_clicked(GtkGestureClick *click, int count, double x, double y, g
         if (found) {
             gtk_single_selection_set_selected(v->selection, i);
             gtk_column_view_scroll_to(v->table, i, NULL, GTK_LIST_SCROLL_FOCUS, NULL);
+            ui_controls(v);
             return;
         }
     }

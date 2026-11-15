@@ -1,7 +1,8 @@
 add_library(ds_store STATIC
-    src/store/schema.c src/store/writer.c src/store/query.c src/store/pending.c
+    src/store/schema.c src/store/writer.c src/store/query.c src/store/pending.c src/store/volume_info.c
     src/core/aggregate.c src/core/hardlinks.c src/store/output.c src/store/snapshot.c)
 target_link_libraries(ds_store PUBLIC ds_core ds_sqlite)
+target_compile_definitions(ds_store PRIVATE DS_VERSION="${PROJECT_VERSION}")
 ds_c_target(ds_store)
 
 add_library(ds_local STATIC src/session/local.c)

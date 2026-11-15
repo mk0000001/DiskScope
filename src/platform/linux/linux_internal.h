@@ -47,6 +47,7 @@ typedef struct {
 
 DsStatus linux_root_open(const DsNativePath *, LinuxRoot *, DsError *);
 void linux_root_close(LinuxRoot *);
+DsVolumeInfo linux_volume_info(int fd);
 char *linux_canonical_path(const DsNativePath *, DsError *);
 
 #endif

@@ -192,16 +192,17 @@ static void volume_free_values(void)
                                 FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS,
                                 NULL);
     g_assert_true(handle != INVALID_HANDLE_VALUE);
-    DsWinVolume volume;
-    g_assert_cmpuint(ds_win_volume_info(handle, dir, &volume), ==, ERROR_SUCCESS);
-    g_assert_cmpint(wcscmp(volume.filesystem, L"NTFS"), ==, 0);
-    g_assert_cmpint(volume.free.quality, ==, DS_KNOWN);
+    ULARGE_INTEGER available, caller_total, free_space;
+    g_assert_true(GetDiskFreeSpaceExW(dir, &available, &caller_total, &free_space));
+    g_assert_cmpuint(available.QuadPart, <=, free_space.QuadPart);
+    DsVolumeInfo volume = ds_win_volume_info(handle);
+    g_assert_cmpint(volume.captured_at, >, 0);
     g_assert_cmpint(volume.available.quality, ==, DS_KNOWN);
-    g_assert_cmpint(volume.caller_total.quality, ==, DS_KNOWN);
-    g_assert_cmpuint(volume.available.bytes, <=, volume.free.bytes);
+    g_assert_cmpuint(volume.available.bytes, <=, caller_total.QuadPart);
     if (volume.total.quality == DS_KNOWN) {
-        g_assert_cmpuint(volume.caller_total.bytes, <=, volume.total.bytes);
-        g_assert_cmpuint(volume.free.bytes, <=, volume.total.bytes);
+        g_assert_cmpuint(caller_total.QuadPart, <=, volume.total.bytes);
+        g_assert_cmpint(volume.used.quality, ==, DS_KNOWN);
+        g_assert_cmpuint(volume.used.bytes, <=, volume.total.bytes);
     }
     g_assert_true(CloseHandle(handle));
     g_assert_true(RemoveDirectoryW(dir));

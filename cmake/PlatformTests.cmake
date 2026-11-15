@@ -1,5 +1,7 @@
 if(BUILD_TESTING)
     if(WIN32)
+        ds_test(integration.windows_cache tests/integration/test_windows_cache.c ${ds_manifest})
+        target_link_libraries(test_integration_windows_cache PRIVATE ds_local ds_store)
         ds_test(platform.windows_walk tests/platform/test_windows_walk.c ${ds_manifest})
         ds_test(platform.windows_metadata tests/platform/test_windows_metadata.c ${ds_manifest})
         foreach(test test_platform_windows_walk test_platform_windows_metadata)

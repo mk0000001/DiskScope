@@ -4,7 +4,6 @@
 static const char schema[] =
     "BEGIN IMMEDIATE;"
     "PRAGMA application_id=1146307407;"
-    "PRAGMA user_version=1;"
     "CREATE TABLE scans("
     " id INTEGER PRIMARY KEY CHECK(id=1), root_raw BLOB, encoding INTEGER,"
     " root_display TEXT, policy TEXT, run_status INTEGER NOT NULL DEFAULT -1,"
@@ -54,8 +53,29 @@ static const char schema[] =
     ") STRICT, WITHOUT ROWID;"
     "CREATE TABLE pending_dirs("
     " sequence INTEGER PRIMARY KEY, node_id INTEGER NOT NULL UNIQUE REFERENCES entries(id)"
-    ") STRICT;"
-    "COMMIT;";
+    ") STRICT;";
+
+static const char volume_schema[] =
+    "CREATE TABLE volume_info("
+    " id INTEGER PRIMARY KEY REFERENCES scans(id) CHECK(id=1),"
+    " captured_at INTEGER NOT NULL CHECK(captured_at>0),"
+    " total BLOB, total_quality INTEGER NOT NULL,"
+    " used BLOB, used_quality INTEGER NOT NULL,"
+    " available BLOB, available_quality INTEGER NOT NULL"
+    ") STRICT;";
+
+static int create_schema(sqlite3 *db, int version)
+{
+    int rc = sqlite3_exec(db, schema, NULL, NULL, NULL);
+    if (rc == SQLITE_OK && version == DS_STORE_SCHEMA_VERSION)
+        rc = sqlite3_exec(db, volume_schema, NULL, NULL, NULL);
+    if (rc == SQLITE_OK) {
+        char *finish = sqlite3_mprintf("PRAGMA user_version=%d; COMMIT;", version);
+        rc = finish ? sqlite3_exec(db, finish, NULL, NULL, NULL) : SQLITE_NOMEM;
+        sqlite3_free(finish);
+    }
+    return rc;
+}
 
 DsStatus ds_sql_status(DsStore *store, int code, DsError *error)
 {
@@ -150,13 +170,13 @@ static int scalar(DsStore *store, const char *sql, int64_t *value)
     return rc;
 }
 
-static int match_schema(DsStore *store)
+static int match_schema(DsStore *store, int version)
 {
     static const char sql[] = "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name";
     sqlite3 *expected = NULL;
     sqlite3_stmt *actual = NULL, *canonical = NULL;
     int rc = sqlite3_open(":memory:", &expected);
-    if (rc == SQLITE_OK) rc = sqlite3_exec(expected, schema, NULL, NULL, NULL);
+    if (rc == SQLITE_OK) rc = create_schema(expected, version);
     if (rc == SQLITE_OK) rc = sqlite3_prepare_v2(expected, sql, -1, &canonical, NULL);
     if (rc == SQLITE_OK) rc = ds_sql_prepare(store, &actual, sql);
     while (rc == SQLITE_OK) {
@@ -191,12 +211,15 @@ static int open_schema(DsStore *store)
         rc = scalar(store, "SELECT count(*) FROM sqlite_schema", &objects);
         if (rc != SQLITE_OK) return rc;
         if (objects != 0) return SQLITE_NOTADB;
-        rc = ds_sql_exec(store, schema);
-    } else if (application != DS_STORE_APPLICATION_ID || version != DS_STORE_SCHEMA_VERSION) {
+        version = DS_STORE_SCHEMA_VERSION;
+        rc = create_schema(store->db, (int)version);
+    } else if (application != DS_STORE_APPLICATION_ID ||
+               (version != 1 && version != DS_STORE_SCHEMA_VERSION)) {
         return SQLITE_NOTADB;
     } else {
-        rc = match_schema(store);
+        rc = match_schema(store, (int)version);
     }
+    if (rc == SQLITE_OK) store->schema_version = (int)version;
     if (rc == SQLITE_OK) rc = scalar(store, "SELECT cache_budget FROM scans WHERE id=1", &budget);
     if (rc == SQLITE_OK && budget < (128LL << 20)) rc = SQLITE_CORRUPT;
     if (rc == SQLITE_OK) store->budget = (uint64_t)budget;
@@ -232,6 +255,12 @@ DsStatus ds_store_open(const DsNativePath *path, DsStoreMode mode,
         g_free(filename);
         return ds_error(error, DS_INVALID, 0, "A file-backed scan store is required");
     }
+#ifdef G_OS_WIN32
+    char *extended = ds_win_extended_path(filename);
+    g_free(filename);
+    filename = extended;
+    if (!filename) return ds_error(error, DS_INVALID, 0, "Invalid Windows store path");
+#endif
     DsStore *store = g_new0(DsStore, 1);
     store->filename = filename;
     store->mode = mode;
@@ -240,7 +269,7 @@ DsStatus ds_store_open(const DsNativePath *path, DsStoreMode mode,
 #ifdef SQLITE_OPEN_NOFOLLOW
     flags |= SQLITE_OPEN_NOFOLLOW;
 #endif
-    int rc = sqlite3_open_v2(filename, &store->db, flags, NULL);
+    int rc = sqlite3_open_v2(filename, &store->db, flags, DS_FILE_VFS);
     if (rc == SQLITE_OK) rc = sqlite3_db_config(store->db, SQLITE_DBCONFIG_DEFENSIVE, 1, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_db_config(store->db, SQLITE_DBCONFIG_TRUSTED_SCHEMA, 0, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_busy_timeout(store->db, 0);

@@ -4,6 +4,8 @@
 #include "diskscope/ds_export.h"
 #include "../store/output.h"
 
+#define DS_JSON_SCHEMA_VERSION 1
+
 void ds_csv_field(GString *line, const char *text, bool protect_formula);
 void ds_json_string(GString *line, const char *text);
 void ds_json_path(GString *line, const DsNativePath *path, const char *display);

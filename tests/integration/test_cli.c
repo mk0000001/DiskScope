@@ -1,4 +1,4 @@
-#include "diskscope/ds_store.h"
+#include "diskscope/ds_snapshot.h"
 #include <gio/gio.h>
 #include <glib/gstdio.h>
 
@@ -42,12 +42,21 @@ static void scan(void)
     DsNativePath path = {0};
     g_assert_cmpint(ds_path_from_arg(output, &path, NULL), ==, DS_OK);
     DsStore *store = NULL;
-    g_assert_cmpint(ds_store_open(&path, DS_STORE_READER, &store, NULL), ==, DS_OK);
+    g_assert_cmpint(ds_snapshot_open(&path, &store, NULL, NULL), ==, DS_OK);
     DsStoreInfo info = {0};
     g_assert_cmpint(ds_store_info(store, &info, NULL), ==, DS_OK);
     g_assert_true(info.entry_count == 2);
     g_assert_true(info.aggregation_complete);
     g_assert_cmpint(info.coverage, ==, DS_COVERAGE_COMPLETE);
+    DsVolumeInfo volume;
+    g_assert_cmpint(ds_store_volume(store, &volume, NULL), ==, DS_OK);
+    g_assert_cmpint(volume.captured_at, >, 0);
+    g_assert_cmpint(volume.available.quality, ==, DS_KNOWN);
+    if (volume.total.quality == DS_KNOWN) {
+        g_assert_cmpuint(volume.total.bytes, >, 17);
+        g_assert_cmpint(volume.used.quality, ==, DS_KNOWN);
+        g_assert_cmpuint(volume.used.bytes, <=, volume.total.bytes);
+    }
     ds_store_info_clear(&info);
     ds_store_close(store);
     ds_path_clear(&path);
@@ -64,6 +73,9 @@ static void scan(void)
             char *log = g_build_filename(child, "diagnostics.txt", NULL);
             g_unlink(log);
             g_free(log);
+            char *lock = g_build_filename(child, "scan.lock", NULL);
+            g_unlink(lock);
+            g_free(lock);
             g_rmdir(child);
             g_free(database);
             g_free(child);

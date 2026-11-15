@@ -2,6 +2,7 @@
 #define DISKSCOPE_SCAN_H
 
 #include "ds_path.h"
+#include "ds_volume.h"
 
 #define DS_BATCH_MAX 512u
 #define DS_BATCH_MSEC 250u
@@ -31,6 +32,10 @@ typedef struct {
     const char *exclude_pattern; /* Optional native basename glob in UTF-8. */
     const DsNativePath *exclude_paths; /* Borrowed absolute paths. */
     size_t exclude_count;
+    /* Optional synchronous hook, once after validating the root and before
+     * any entry batches. The reading is borrowed for the duration of the call. */
+    DsVolumeSink volume_sink;
+    void *volume_data;
 } DsScanOptions;
 
 typedef struct {

@@ -22,13 +22,6 @@ typedef struct {
     bool legacy_known;
 } DsWinNode;
 
-typedef struct {
-    WCHAR filesystem[32];
-    DWORD flags;
-    DsSize total, free, available, caller_total;
-    DWORD space_error;
-} DsWinVolume;
-
 extern const DsWinMetadataOps ds_win_metadata_ops;
 
 WCHAR *ds_win_absolute_path(const DsNativePath *path, DWORD *code);
@@ -43,7 +36,7 @@ void ds_win_measure_file(const DsWinMetadataOps *ops, const WCHAR *path,
                          DsEntry *entry);
 bool ds_win_same_volume(const DsWinNode *a, const DsWinNode *b);
 bool ds_win_same_node(const DsWinNode *a, const DsWinNode *b);
-DWORD ds_win_volume_info(HANDLE root, const WCHAR *absolute_path, DsWinVolume *volume);
+DsVolumeInfo ds_win_volume_info(HANDLE root);
 DsStatus ds_win_walk_with_metadata_ops(const DsScanOptions *, DsControl *, DsEntrySink, void *,
                                        DsError *, const DsWinMetadataOps *);
 

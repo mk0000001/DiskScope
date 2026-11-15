@@ -541,6 +541,11 @@ DsStatus ds_walk(const DsScanOptions *options, DsControl *control, DsEntrySink s
         walk.path = g_string_new(walk.root.path);
         walk.excluded_paths = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
         walk.status = configure_exclusions(&walk);
+        if (walk.status == DS_OK && options->volume_sink && checkpoint(&walk)) {
+            DsVolumeInfo volume = linux_volume_info(walk.root.fd);
+            if (checkpoint(&walk))
+                walk.status = options->volume_sink(&volume, options->volume_data, error);
+        }
         if (walk.status == DS_OK && options->profile == DS_STANDARD && options->jobs >= 2 &&
             !worker_start(&walk.worker, error)) walk.status = DS_LIMIT;
         if (walk.status == DS_OK && checkpoint(&walk)) {

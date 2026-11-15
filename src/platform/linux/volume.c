@@ -73,6 +73,39 @@ static DsSize capacity(uint64_t count, uint64_t fragment_size)
     return result;
 }
 
+static int read_capacity(int fd, DsVolumeInfo *volume, DsSize *free_space)
+{
+    *volume = (DsVolumeInfo){.total.quality = DS_UNAVAILABLE, .used.quality = DS_UNAVAILABLE,
+                             .available.quality = DS_UNAVAILABLE};
+    *free_space = (DsSize){0, DS_UNAVAILABLE};
+    struct statvfs stats;
+    int code = fstatvfs(fd, &stats) != 0 ? errno : 0;
+    volume->captured_at = g_get_real_time() / G_USEC_PER_SEC;
+    if (code) {
+        DsQuality quality = code == EOVERFLOW ? DS_OVERFLOW :
+            (code == ENOTSUP || code == ENOSYS) ? DS_UNSUPPORTED : DS_UNAVAILABLE;
+        volume->total.quality = volume->used.quality = volume->available.quality = quality;
+        free_space->quality = quality;
+        return code;
+    }
+    volume->total = capacity(stats.f_blocks, stats.f_frsize);
+    if (stats.f_bfree <= stats.f_blocks) {
+        *free_space = capacity(stats.f_bfree, stats.f_frsize);
+        volume->used = capacity(stats.f_blocks - stats.f_bfree, stats.f_frsize);
+    }
+    if (stats.f_bavail <= MIN(stats.f_bfree, stats.f_blocks))
+        volume->available = capacity(stats.f_bavail, stats.f_frsize);
+    return 0;
+}
+
+DsVolumeInfo linux_volume_info(int fd)
+{
+    DsVolumeInfo volume;
+    DsSize free_space;
+    read_capacity(fd, &volume, &free_space);
+    return volume;
+}
+
 DsStatus ds_linux_volume(const DsNativePath *path, DsLinuxVolume *volume, DsError *error)
 {
     if (!volume) return ds_error(error, DS_INVALID, EINVAL, "Missing volume output");
@@ -94,15 +127,12 @@ DsStatus ds_linux_volume(const DsNativePath *path, DsLinuxVolume *volume, DsErro
     volume->boundary = root.method == LINUX_OPEN_AT2 && probe >= 0 ? DS_LINUX_BOUNDARY_OPENAT2
         : root.metadata.mount_id ? DS_LINUX_BOUNDARY_MOUNT_ID : DS_LINUX_BOUNDARY_MOUNTINFO;
 
-    struct statvfs stats;
-    if (fstatvfs(root.fd, &stats) == 0) {
-        volume->total = capacity(stats.f_blocks, stats.f_frsize);
-        volume->free = capacity(stats.f_bfree, stats.f_frsize);
-        volume->available = capacity(stats.f_bavail, stats.f_frsize);
-    } else {
-        int code = errno;
+    DsVolumeInfo reading;
+    int code = read_capacity(root.fd, &reading, &volume->free);
+    volume->total = reading.total;
+    volume->available = reading.available;
+    if (code)
         status = ds_error(error, DS_PARTIAL, code, "Cannot query volume capacity: %s", g_strerror(code));
-    }
     linux_root_close(&root);
     return status;
 }

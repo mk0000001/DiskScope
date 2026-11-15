@@ -1,5 +1,6 @@
 #include "ui.h"
 #include "local.h"
+#include "volume_view.h"
 #include <glib/gstdio.h>
 
 void ui_copy_path(DsNativePath *dst, const DsNativePath *src)
@@ -17,7 +18,10 @@ static void free_work(gpointer data)
     ds_path_clear(&w->cache);
     ds_session_request_cancel(w->session);
     ds_session_unref(w->session);
+    ds_recovered_free(w->recovered);
     ds_details_clear(&w->detail);
+    g_free((char *)w->export_filter.filter);
+    g_free((char *)w->export_filter.extension);
     g_free(w->exclude);
     g_free(w->report);
     g_free(w);
@@ -90,11 +94,20 @@ static void cancel_work(GCancellable *cancel, gpointer control)
     ds_control_cancel(control);
 }
 
+static char *recovery_status(const DsStoreInfo *info)
+{
+    return g_strdup_printf(UI("%s · %" G_GUINT64_FORMAT "개%s"),
+        info->coverage == DS_COVERAGE_COMPLETE ? UI("최근 캐시 결과") : UI("복구된 부분 결과"),
+        info->entry_count, info->aggregation_complete ? "" : UI(" · 집계되지 않음"));
+}
+
 static DsStatus run(Work *w, GCancellable *cancel, DsControl *control)
 {
     if (g_cancellable_is_cancelled(cancel))
         return DS_CANCELED;
     DsError *error = &w->error;
+    if (w->op == RECOVER)
+        return ds_recovery_latest(&w->cache, control, &w->recovered, error);
     if (w->op == START) {
         DsScanOptions options;
         ds_scan_options_init(&options, w->profile);
@@ -117,14 +130,23 @@ static DsStatus run(Work *w, GCancellable *cancel, DsControl *control)
     case OPEN:
         status = stable_import(w, reader, control, error);
         break;
-    case AGGREGATE:
+    case AGGREGATE: {
         status = ds_finalize(reader, control, error);
+        if (status == DS_OK) {
+            DsStoreInfo info = {0};
+            if (ds_store_info(reader, &info, NULL) == DS_OK)
+                w->report = recovery_status(&info);
+            ds_store_info_clear(&info);
+        }
         break;
+    }
     case SAVE:
         status = ds_snapshot_save(reader, &w->target, control, error);
         break;
     case EXPORT: {
-        DsExportOptions options = {.format=w->format, .destination=w->target, .bom=true};
+        DsExportOptions options = {.format=w->format, .destination=w->target, .bom=true,
+                                   .metric=w->metric, .selected_id=w->id,
+                                   .view=w->export_filtered ? &w->export_filter : NULL};
         status = ds_export(reader, &options, control, error);
         break;
     }
@@ -152,6 +174,9 @@ static DsStatus run(Work *w, GCancellable *cancel, DsControl *control)
         break;
     case STATS:
         status = ds_statistics_report(reader, w->metric, w->group_age, cancel, &w->report, error);
+        break;
+    case VOLUME:
+        w->report = ds_ui_volume_summary(reader, error);
         break;
     default:
         break;
@@ -200,15 +225,17 @@ static void done(GObject *source, GAsyncResult *result, gpointer data)
     (void)source;
     View *v = data;
     Work *w = g_task_get_task_data(G_TASK(result));
-    bool background = w->op == DETAILS || w->op == STATS;
-    if (v->closing || (background && w->generation != v->generation))
+    bool volume = w->op == VOLUME;
+    bool background = volume || w->op == DETAILS || w->op == STATS;
+    if (v->closing || (!volume && background && w->generation != v->generation) ||
+        (volume && (!v->db.raw || !g_bytes_equal(v->db.raw, w->db.raw))))
         return;
     if (!background) {
         v->busy = false;
         g_clear_object(&v->operation);
     }
     if (w->status != DS_OK) {
-        if (!background && w->status != DS_CANCELED)
+        if (!background && !w->automatic && w->status != DS_CANCELED)
             ui_message(v, UI("작업을 완료하지 못했습니다"), w->error.message);
         if (w->op == STATS)
             gtk_text_buffer_set_text(v->statistics, w->error.message, -1);
@@ -217,6 +244,7 @@ static void done(GObject *source, GAsyncResult *result, gpointer data)
     }
     switch (w->op) {
     case START:
+        g_clear_pointer(&v->recovered, ds_recovered_free);
         ds_session_unref(v->session);
         v->session = w->session;
         w->session = NULL;
@@ -224,24 +252,63 @@ static void done(GObject *source, GAsyncResult *result, gpointer data)
         v->finished = false;
         v->sequence = v->refreshed = 0;
         ds_path_clear(&v->db);
+        ui_volume_load(v);
         ui_refresh(v);
         ui_tick(v);
         break;
     case OPEN:
+        g_clear_pointer(&v->recovered, ds_recovered_free);
         ds_session_unref(v->session);
         v->session = NULL;
         ui_copy_path(&v->db, &w->db);
+        ui_volume_load(v);
         ui_label(v->status, w->report);
         ui_refresh(v);
         ui_details(v, 1, 1, NULL);
         break;
+    case RECOVER: {
+        if (v->recovered && !v->cache_location_changed &&
+            !ds_recovered_newer(w->recovered, v->recovered)) {
+            if (!w->automatic)
+                ui_message(v, UI("가장 최근 캐시 결과를 보고 있습니다"), NULL);
+            break;
+        }
+        if (!w->recovered) {
+            if (!w->automatic)
+                ui_message(v, UI("열 수 있는 최근 캐시가 없습니다"), UI("실행 중인 스캔은 제외됩니다."));
+            break;
+        }
+        ds_session_unref(v->session);
+        v->session = NULL;
+        g_clear_pointer(&v->recovered, ds_recovered_free);
+        v->recovered = g_steal_pointer(&w->recovered);
+        v->cache_location_changed = false;
+        ui_copy_path(&v->db, ds_recovered_path(v->recovered));
+        ui_volume_load(v);
+        const DsStoreInfo *info = ds_recovered_info(v->recovered);
+        v->recovered_aggregated = info->aggregation_complete;
+        char *status = recovery_status(info);
+        ui_label(v->status, status);
+        g_free(status);
+        ui_refresh(v);
+        ui_details(v, 1, 1, NULL);
+        break;
+    }
     case DETAILS: apply_details(v, w); break;
     case STATS: gtk_text_buffer_set_text(v->statistics, w->report, -1); break;
+    case VOLUME:
+        ui_label(v->volume_label, w->report ? w->report : UI("볼륨 정보 없음"));
+        break;
     case COMPARE:
         gtk_text_buffer_set_text(v->statistics, w->report, -1);
         gtk_stack_set_visible_child_name(GTK_STACK(v->stack), "statistics");
         break;
     case AGGREGATE:
+        if (v->recovered) {
+            v->recovered_aggregated = true;
+            if (w->report)
+                ui_label(v->status, w->report);
+        }
         ui_refresh(v);
         ui_details(v, 1, 1, NULL);
         ui_message(v, UI("관찰된 항목 집계 완료"), UI("기존 스캔의 범위와 상태를 유지합니다."));
@@ -255,7 +322,8 @@ static void done(GObject *source, GAsyncResult *result, gpointer data)
 
 void ui_launch(View *v, Work *w)
 {
-    GCancellable **slot = w->op == DETAILS || w->op == STATS ? &v->detail_task : &v->operation;
+    GCancellable **slot = w->op == VOLUME ? &v->volume_task :
+        w->op == DETAILS || w->op == STATS ? &v->detail_task : &v->operation;
     if (*slot) {
         g_cancellable_cancel(*slot);
         g_clear_object(slot);
@@ -271,33 +339,60 @@ void ui_launch(View *v, Work *w)
     ui_controls(v);
 }
 
+void ui_volume_load(View *v)
+{
+    if (v->volume_task)
+        g_cancellable_cancel(v->volume_task);
+    ui_label(v->volume_label, "");
+    if (!v->db.raw)
+        return;
+    Work *work = g_new0(Work, 1);
+    work->op = VOLUME;
+    ui_copy_path(&work->db, &v->db);
+    ui_launch(v, work);
+}
+
+void ui_recover(View *v, bool automatic)
+{
+    if (v->closing || v->busy || ui_alive(v) || (automatic && v->db.raw))
+        return;
+    Work *work = g_new0(Work, 1);
+    work->op = RECOVER;
+    work->automatic = automatic;
+    ui_copy_path(&work->cache, &v->cache);
+    ui_launch(v, work);
+}
+
 static void file_selected(GObject *source, GAsyncResult *result, gpointer data)
 {
     GtkWindow *window = data;
     View *v = g_object_get_data(G_OBJECT(window), "disk-view");
     WorkType op = GPOINTER_TO_INT(g_object_get_data(source, "disk-action"));
     GtkFileDialog *dialog = GTK_FILE_DIALOG(source);
+    Work *pending_export = g_object_steal_data(source, "disk-export-work");
     GFile *file = op == START || op == CACHE ? gtk_file_dialog_select_folder_finish(dialog, result, NULL) :
                   op == SAVE || op == EXPORT ? gtk_file_dialog_save_finish(dialog, result, NULL) :
                   gtk_file_dialog_open_finish(dialog, result, NULL);
     if (file && !v->closing && !v->busy && !ui_alive(v)) {
         char *path = g_file_get_path(file);
-        Work *w = g_new0(Work, 1);
+        Work *w = pending_export ? g_steal_pointer(&pending_export) : g_new0(Work, 1);
         if (path && ds_path_from_arg(path, &w->target, NULL) == DS_OK) {
             if (op == CACHE) {
                 ui_copy_path(&v->cache, &w->target);
+                v->cache_location_changed = true;
                 ui_settings_save(v);
                 ui_message(v, UI("캐시 위치 변경"), UI("다음 스캔부터 적용됩니다."));
                 free_work(w);
             } else {
                 w->op = op;
-                w->metric = ui_metric(v);
+                if (op != EXPORT)
+                    w->metric = ui_metric(v);
                 w->profile = gtk_drop_down_get_selected(v->profile) == 1 ? DS_STANDARD : DS_CONSERVATIVE;
-                w->format = (DsExportFormat)gtk_drop_down_get_selected(v->format);
                 w->include_hidden = !gtk_check_button_get_active(GTK_CHECK_BUTTON(v->hide));
                 const char *exclude = gtk_editable_get_text(GTK_EDITABLE(v->exclude));
                 w->exclude = *exclude ? g_strdup(exclude) : NULL;
-                ui_copy_path(&w->db, &v->db);
+                if (op != EXPORT)
+                    ui_copy_path(&w->db, &v->db);
                 ui_copy_path(&w->cache, &v->cache);
                 ui_launch(v, w);
             }
@@ -307,6 +402,8 @@ static void file_selected(GObject *source, GAsyncResult *result, gpointer data)
         }
         g_free(path);
     }
+    if (pending_export)
+        free_work(pending_export);
     g_clear_object(&file);
     g_object_unref(window);
 }
@@ -321,6 +418,25 @@ void ui_file_dialog(View *v, WorkType op)
     } else if (op == SAVE || op == EXPORT) {
         const char *extensions[] = {"csv", "json", "jsonl"};
         guint format = gtk_drop_down_get_selected(v->format);
+        if (op == EXPORT) {
+            UiExportScope scope = (UiExportScope)gtk_drop_down_get_selected(v->export_scope);
+            Work *work = g_new0(Work, 1);
+            work->format = (DsExportFormat)format;
+            work->metric = ui_metric(v);
+            ui_copy_path(&work->db, &v->db);
+            if (scope == UI_EXPORT_SELECTION)
+                work->id = v->export_selection;
+            else if (scope == UI_EXPORT_FILTER) {
+                bool tree;
+                work->export_filtered = true;
+                work->export_filter = ui_result_query(v, &tree);
+                work->export_filter.filter = g_strdup(work->export_filter.filter);
+                work->export_filter.extension = g_strdup(work->export_filter.extension);
+            }
+            g_object_set_data_full(G_OBJECT(dialog), "disk-export-work", work, free_work);
+            gtk_file_dialog_set_title(dialog, scope == UI_EXPORT_SELECTION ? UI("선택 항목 내보내기") :
+                scope == UI_EXPORT_FILTER ? UI("필터 일치 항목 내보내기") : UI("전체 결과 내보내기"));
+        }
         char *name = op == SAVE ? g_strdup("result.dscan") : g_strdup_printf("result.%s", extensions[MIN(format, 2u)]);
         gtk_file_dialog_set_initial_name(dialog, name);
         gtk_file_dialog_save(dialog, v->window, NULL, file_selected, g_object_ref(v->window));

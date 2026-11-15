@@ -1,0 +1,7 @@
+target_sources(ds_local PRIVATE src/session/cache_lease.c)
+target_sources(ds_session PRIVATE src/session/recovery.c)
+if(BUILD_TESTING)
+    ds_test(integration.recovery tests/integration/test_recovery.c)
+    target_link_libraries(test_integration_recovery PRIVATE ds_session)
+    set_tests_properties(integration.recovery PROPERTIES TIMEOUT 30)
+endif()

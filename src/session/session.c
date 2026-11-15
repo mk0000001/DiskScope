@@ -1,6 +1,7 @@
 #include "diskscope/ds_session.h"
 #include "diskscope/ds_store.h"
 #include "local.h"
+#include "cache_lease.h"
 #include "protocol.h"
 
 #include <gio/gio.h>
@@ -11,6 +12,7 @@ struct DsSession {
     GCond changed;
     GSubprocess *child;
     DsNativePath db;
+    DsCacheLease *lease;
     char *id;
     DsSessionEvent event;
     DsSessionCallback callback;
@@ -33,6 +35,7 @@ void ds_session_unref(DsSession *session)
     if (!session || !g_atomic_ref_count_dec(&session->references))
         return;
     g_object_unref(session->child);
+    ds_cache_lease_close(session->lease);
     ds_path_clear(&session->db);
     g_free(session->id);
     json_object_unref(session->start);
@@ -263,6 +266,7 @@ static gpointer receive_events(gpointer ptr)
     DsError recovery = {0};
     bool reconciled = reconcile_cache(s, !normal ? DS_IO : late_cancel ? DS_CANCELED : DS_RUN_RUNNING,
                                       &recovery);
+    g_clear_pointer(&s->lease, ds_cache_lease_close);
     g_mutex_lock(&s->lock);
     s->event.exited = true;
     if (!normal) {
@@ -346,7 +350,8 @@ DsSession *ds_session_start(const DsScanOptions *options, DsSessionCallback call
     char *worker = ds_worker_binary(error);
     char *root = worker ? absolute_root(&options->root, error) : NULL;
     char *cache = root ? ds_private_cache(&options->cache_path, error) : NULL;
-    char *database = cache ? g_build_filename(cache, "scan.sqlite", NULL) : NULL;
+    DsCacheLease *lease = cache ? ds_cache_lease_open(cache, true, false, error) : NULL;
+    char *database = lease ? g_build_filename(cache, "scan.sqlite", NULL) : NULL;
     DsNativePath native_root = {0}, native_cache = {0}, native_db = {0};
     DsSession *s = NULL;
     if (database && ds_path_from_arg(root, &native_root, error) == DS_OK &&
@@ -361,6 +366,8 @@ DsSession *ds_session_start(const DsScanOptions *options, DsSessionCallback call
             g_atomic_ref_count_init(&s->references);
             g_mutex_init(&s->lock);
             g_cond_init(&s->changed);
+            s->lease = lease;
+            lease = NULL;
             s->db = native_db;
             native_db = (DsNativePath){0};
             s->child = child;
@@ -377,6 +384,7 @@ DsSession *ds_session_start(const DsScanOptions *options, DsSessionCallback call
             g_error_free(failure);
         }
     }
+    ds_cache_lease_close(lease);
     g_free(database);
     g_free(cache);
     g_free(root);

@@ -89,8 +89,12 @@ static void apply(GObject *object, GAsyncResult *result, gpointer data)
     GTask *task = G_TASK(result);
     Configuration *c = g_task_get_task_data(task);
     bool current = c->revision == g_atomic_int_get(&latest);
-    if (v->closing || !current || !g_task_propagate_boolean(task, NULL))
+    if (v->closing)
         return;
+    if (!current || !g_task_propagate_boolean(task, NULL)) {
+        ui_recover(v, true);
+        return;
+    }
     v->applying_settings = true;
     gtk_drop_down_set_selected(v->theme, (guint)CLAMP(g_key_file_get_integer(c->file, "Explorer", "Theme", NULL), 0, 2));
     gtk_drop_down_set_selected(v->profile, (guint)CLAMP(g_key_file_get_integer(c->file, "Explorer", "Profile", NULL), 0, 1));
@@ -112,6 +116,7 @@ static void apply(GObject *object, GAsyncResult *result, gpointer data)
         g_free(encoded);
     }
     v->applying_settings = false;
+    ui_recover(v, true);
 }
 
 void ui_settings_load(View *v)

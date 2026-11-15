@@ -42,7 +42,7 @@ cmake --preset release
 cmake --build --preset release
 ctest --preset release
 cpack --config build/release/CPackConfig.cmake -G DEB
-sudo apt install ./diskscope_0.1.0_amd64.deb
+sudo apt install ./diskscope_0.1.1_amd64.deb
 diskscope
 ```
 
@@ -53,7 +53,10 @@ The Windows bundle and matching source archive are built with the [portable pack
 ```sh
 diskscope-cli scan --root ./fixture --output result.dscan --json
 diskscope-cli export --input result.dscan --format jsonl --output report.jsonl
+diskscope-cli export --input result.dscan --selected-id 2 --metric allocated --format jsonl --output selected.jsonl
 diskscope-cli compare --before old.dscan --after result.dscan --output changes.jsonl
 ```
 
 Use `--cache-dir` to choose another local cache base. The CLI accepts `--hide-hidden`, an optional basename `--exclude-pattern`, and repeatable `--exclude-path` options. A cancellation request can still produce a committed partial snapshot. A second Ctrl+C during backup cancels its publication. Exit codes are 0 for success, 2 for gaps, 3 for cancellation, 4 for invalid usage/input, and 5 for worker, I/O or resource failure.
+
+The export entry ID comes from a JSON or JSONL export. Selecting a file writes that row. Selecting a folder writes its row and all descendants. In the GUI, **필터 일치 전체** exports every row matching the active inputs and view type, including matches beyond the Top 100/1000 display cap. The selected metric is recorded alongside all three metric values.

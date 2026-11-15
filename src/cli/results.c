@@ -20,12 +20,15 @@ static gpointer monitor(gpointer data)
 static int command(int argc, char **argv, bool compare)
 {
     char *input = NULL, *after = NULL, *format = NULL, *output = NULL;
+    char *selected = NULL, *metric = NULL;
     gboolean bom = FALSE;
     GOptionEntry export_options[] = {
         {"input", 0, 0, G_OPTION_ARG_FILENAME, &input, "Input .dscan", "FILE"},
         {"format", 0, 0, G_OPTION_ARG_STRING, &format, "csv, json or jsonl", "FORMAT"},
         {"output", 0, 0, G_OPTION_ARG_FILENAME, &output, "Destination file", "FILE"},
         {"bom", 0, 0, G_OPTION_ARG_NONE, &bom, "Write UTF-8 BOM for CSV", NULL},
+        {"selected-id", 0, 0, G_OPTION_ARG_STRING, &selected, "Node ID to export with its descendants (0 for all)", "ID"},
+        {"metric", 0, 0, G_OPTION_ARG_STRING, &metric, "Selected metric recorded in the export", "logical|allocated|unique_allocated"},
         {0}
     };
     GOptionEntry compare_options[] = {
@@ -44,6 +47,8 @@ static int command(int argc, char **argv, bool compare)
     DsNativePath source = {0}, second = {0}, target = {0};
     DsStore *reader = NULL, *newer = NULL;
     DsExportFormat kind = DS_EXPORT_CSV;
+    DsMetric selected_metric = DS_LOGICAL;
+    guint64 selected_id = 0;
     GError *parse_error = NULL;
     if (!g_option_context_parse_strv(parser, &args, &parse_error)) {
         ds_error(&error, DS_INVALID, parse_error->code, "%s", parse_error->message);
@@ -64,6 +69,18 @@ static int command(int argc, char **argv, bool compare)
             ds_error(&error, DS_INVALID, 0, "Expected csv, json or jsonl");
             goto done;
         }
+        if (selected && !g_ascii_string_to_unsigned(selected, 10, 0, INT64_MAX, &selected_id, NULL)) {
+            ds_error(&error, DS_INVALID, 0, "Expected a nonnegative signed 64-bit node ID");
+            goto done;
+        }
+        if (g_strcmp0(metric, "allocated") == 0)
+            selected_metric = DS_ALLOCATED;
+        else if (g_strcmp0(metric, "unique_allocated") == 0)
+            selected_metric = DS_UNIQUE;
+        else if (metric && strcmp(metric, "logical") != 0) {
+            ds_error(&error, DS_INVALID, 0, "Expected logical, allocated or unique_allocated");
+            goto done;
+        }
     }
     if (ds_path_from_arg(input, &source, &error) != DS_OK ||
         ds_path_from_arg(output, &target, &error) != DS_OK ||
@@ -82,7 +99,10 @@ static int command(int argc, char **argv, bool compare)
             if (status == DS_OK)
                 status = ds_compare_save(reader, newer, &target, &control, &error);
         } else {
-            DsExportOptions options = {.format=kind, .destination=target, .bom=bom};
+            DsExportOptions options = {
+                .format = kind, .destination = target, .bom = bom,
+                .selected_id = (int64_t)selected_id, .metric = selected_metric,
+            };
             status = ds_export(reader, &options, &control, &error);
         }
     }
@@ -102,6 +122,8 @@ done:
     g_free(after);
     g_free(format);
     g_free(output);
+    g_free(selected);
+    g_free(metric);
     return ds_cli_result(status, &error);
 }
 

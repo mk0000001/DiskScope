@@ -170,7 +170,7 @@ DsStatus ds_store_relative_path(DsStore *store, int64_t id, DsNativePath *out, D
     return status;
 }
 
-static void clear_row(DsRow *row)
+void ds_query_clear_row(DsRow *row)
 {
     ds_path_clear(&row->entry.name);
     g_free(row->display);
@@ -179,7 +179,7 @@ static void clear_row(DsRow *row)
 void ds_page_free(DsPage *page)
 {
     if (!page) return;
-    for (size_t i = 0; i < page->count; ++i) clear_row(&page->rows[i]);
+    for (size_t i = 0; i < page->count; ++i) ds_query_clear_row(&page->rows[i]);
     g_free(page->rows);
     ds_store_info_clear(&page->info);
     g_free(page);
@@ -321,15 +321,34 @@ static void query_sort(GString *sql, const DsQuery *query)
     }
 }
 
+static const char select_rows[] =
+    "SELECT e.id,e.parent_id,e.name,e.name_encoding,e.display,e.kind,e.reason,e.os_code,"
+    " e.logical,e.logical_quality,e.allocated,e.allocated_quality,e.identity,e.links,e.mtime,"
+    " a.node_id,a.logical,a.logical_quality,a.logical_unknown,a.allocated,a.allocated_quality,"
+    " a.allocated_unknown,a.unique_allocated,a.unique_quality,a.unique_unknown,a.representative_id,"
+    " a.entry_count,a.file_count,a.unique_file_count"
+    " FROM entries e LEFT JOIN aggregates a ON a.generation=?4 AND a.node_id=e.id";
+
+int ds_query_prepare_entry(DsStore *store, sqlite3_stmt **stmt, int64_t generation)
+{
+    char *sql = g_strconcat(select_rows, " WHERE e.id=?1", NULL);
+    int rc = ds_sql_prepare(store, stmt, sql);
+    g_free(sql);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(*stmt, 4, generation);
+    return rc;
+}
+
+int ds_query_step_entry(sqlite3_stmt *stmt, int64_t id, DsRow *row)
+{
+    int rc = sqlite3_reset(stmt);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, 1, id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+    return rc == SQLITE_ROW ? read_row(stmt, row) : rc;
+}
+
 static int query_rows(DsStore *store, const DsQuery *query, DsPage *page, size_t limit)
 {
-    GString *sql = g_string_new(
-        "SELECT e.id,e.parent_id,e.name,e.name_encoding,e.display,e.kind,e.reason,e.os_code,"
-        " e.logical,e.logical_quality,e.allocated,e.allocated_quality,e.identity,e.links,e.mtime,"
-        " a.node_id,a.logical,a.logical_quality,a.logical_unknown,a.allocated,a.allocated_quality,"
-        " a.allocated_unknown,a.unique_allocated,a.unique_quality,a.unique_unknown,a.representative_id,"
-        " a.entry_count,a.file_count,a.unique_file_count"
-        " FROM entries e LEFT JOIN aggregates a ON a.generation=?4 AND a.node_id=e.id");
+    GString *sql = g_string_new(select_rows);
     query_filter(sql, query, true);
     query_sort(sql, query);
     g_string_append(sql, " LIMIT ?5 OFFSET ?6");

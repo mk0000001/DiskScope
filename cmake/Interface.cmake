@@ -21,7 +21,7 @@ if(DS_GUI)
     target_sources(ds_core PRIVATE src/core/statistics.c)
 
     add_executable(diskscope WIN32 src/ui/main.c src/ui/window.c src/ui/jobs.c
-        src/ui/explorer.c src/ui/details.c src/ui/settings.c ${ds_manifest})
+        src/ui/explorer.c src/ui/details.c src/ui/settings.c src/ui/volume_view.c ${ds_manifest})
     if(WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
         target_link_options(diskscope PRIVATE -mwindows)
     endif()

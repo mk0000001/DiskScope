@@ -7,6 +7,7 @@
 #include <glib/gstdio.h>
 #include <sys/stat.h>
 #ifdef G_OS_WIN32
+#include "../core/win_io.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <aclapi.h>
@@ -44,6 +45,7 @@ static bool private_mkdir(const char *name)
     SECURITY_ATTRIBUTES attributes = {sizeof attributes, &descriptor, FALSE};
     ok = SetEntriesInAclW(1, &access, NULL, &acl) == ERROR_SUCCESS &&
          InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) &&
+         SetSecurityDescriptorOwner(&descriptor, user->User.Sid, FALSE) &&
          SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE) &&
          SetSecurityDescriptorControl(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED) &&
          CreateDirectoryW(path, &attributes);
@@ -61,7 +63,7 @@ static bool private_mkdir(const char *name)
 }
 #endif
 
-static bool local_volume(const char *path)
+bool ds_cache_is_local(const char *path)
 {
 #ifdef G_OS_WIN32
     wchar_t *wide = (wchar_t *)g_utf8_to_utf16(path, -1, NULL, NULL, NULL);
@@ -92,7 +94,8 @@ static bool local_volume(const char *path)
 bool ds_cache_has_reserve(const char *folder)
 {
 #ifdef G_OS_WIN32
-    wchar_t *wide = (wchar_t *)g_utf8_to_utf16(folder, -1, NULL, NULL, NULL);
+    g_autofree char *path = ds_win_extended_path(folder);
+    wchar_t *wide = path ? (wchar_t *)g_utf8_to_utf16(path, -1, NULL, NULL, NULL) : NULL;
     ULARGE_INTEGER available;
     bool enough = wide && GetDiskFreeSpaceExW(wide, &available, NULL, NULL) &&
                   available.QuadPart >= DS_CACHE_FREE_RESERVE;
@@ -105,15 +108,27 @@ bool ds_cache_has_reserve(const char *folder)
 #endif
 }
 
-char *ds_private_cache(const DsNativePath *requested, DsError *error)
+char *ds_cache_base(const DsNativePath *requested, DsError *error)
 {
     char *base = requested && requested->raw ? ds_path_arg(requested, error) :
                  g_build_filename(g_get_user_cache_dir(), "diskscope", NULL);
     if (!base)
         return NULL;
+#ifdef G_OS_WIN32
+    char *absolute = ds_win_extended_path(base);
+    if (!absolute) ds_error(error, DS_INVALID, 0, "Invalid Windows cache path");
+#else
     char *absolute = g_canonicalize_filename(base, NULL);
+#endif
     g_free(base);
-    if (g_mkdir_with_parents(absolute, 0700) || !local_volume(absolute) ||
+    return absolute;
+}
+
+char *ds_private_cache(const DsNativePath *requested, DsError *error)
+{
+    char *absolute = ds_cache_base(requested, error);
+    if (!absolute) return NULL;
+    if (g_mkdir_with_parents(absolute, 0700) || !ds_cache_is_local(absolute) ||
         !ds_cache_has_reserve(absolute)) {
         ds_error(error, DS_LIMIT, errno, "Choose a local cache with at least 256 MiB available");
         g_free(absolute);
@@ -135,6 +150,9 @@ char *ds_private_cache(const DsNativePath *requested, DsError *error)
 
 uint64_t ds_cache_usage(const char *folder)
 {
+#ifdef G_OS_WIN32
+    return ds_win_cache_usage(folder);
+#else
     GDir *dir = g_dir_open(folder, 0, NULL);
     if (!dir)
         return UINT64_MAX;
@@ -152,6 +170,7 @@ uint64_t ds_cache_usage(const char *folder)
     }
     g_dir_close(dir);
     return size;
+#endif
 }
 
 char *ds_worker_binary(DsError *error)

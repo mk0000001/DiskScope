@@ -4,6 +4,7 @@
 #include <glib/gstdio.h>
 #include <sqlite3.h>
 #ifdef G_OS_WIN32
+#include "../core/win_io.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #endif
@@ -64,8 +65,13 @@ DsStatus ds_output_begin(DsStore *source, const DsNativePath *path, DsOutput *ou
     char *arg = ds_path_arg(path, error);
     if (!arg)
         return DS_INVALID;
+#ifdef G_OS_WIN32
+    char *destination = ds_win_extended_path(arg);
+#else
     char *destination = g_canonicalize_filename(arg, NULL);
+#endif
     g_free(arg);
+    if (!destination) return ds_error(error, DS_INVALID, 0, "Invalid output path");
     if (conflicts(source, destination)) {
         g_free(destination);
         return ds_error(error, DS_INVALID, 0, "Output would replace a source database or its journal");

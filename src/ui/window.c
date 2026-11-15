@@ -38,9 +38,21 @@ void ui_controls(View *v)
     gtk_widget_set_sensitive(v->cancel, (running && event.stage < DS_CANCEL_REQUESTED) ||
                                        v->operation != NULL);
     gtk_widget_set_sensitive(v->save, result);
-    gtk_widget_set_sensitive(v->export, result);
+    guint export_scope = gtk_drop_down_get_selected(v->export_scope);
+    bool filtered = false;
+    if (result && export_scope == UI_EXPORT_FILTER && v->mode != EXTENSIONS && v->mode != DATES) {
+        bool tree;
+        ui_result_query(v, &tree);
+        filtered = !tree;
+    }
+    gtk_widget_set_sensitive(v->export, result && (export_scope == UI_EXPORT_ALL ||
+        (export_scope == UI_EXPORT_SELECTION && v->export_selection > 0) || filtered));
     gtk_widget_set_sensitive(v->compare, result);
-    gtk_widget_set_sensitive(v->aggregate, result && v->session && event.result != DS_OK);
+    bool partial_recovery = v->recovered &&
+        !v->recovered_aggregated && ds_recovered_info(v->recovered)->coverage == DS_COVERAGE_PARTIAL;
+    gtk_widget_set_sensitive(v->aggregate, result && (partial_recovery ||
+                             (v->session && event.result != DS_OK)));
+    gtk_widget_set_sensitive(v->recover, !running && !v->busy);
     gtk_widget_set_sensitive(v->copy, v->detail.path.raw != NULL);
     gtk_widget_set_sensitive(v->reveal, v->detail.path.raw != NULL);
     gtk_widget_set_sensitive(v->rescan, v->detail.path.raw && v->selected_kind == DS_DIRECTORY &&
@@ -85,7 +97,10 @@ gboolean ui_tick(gpointer data)
         v->sequence = e.commit_seq;
         v->refreshed = now;
         if (e.exited || !v->db.raw) {
+            bool first_result = !v->db.raw;
             ui_copy_path(&v->db, ds_session_db_path(v->session));
+            if (first_result)
+                ui_volume_load(v);
             ui_refresh(v);
             ui_details(v, 1, 1, NULL);
         } else if (v->base && v->mode != TREE) {
@@ -165,6 +180,8 @@ static void action(GtkButton *button, gpointer data)
             ds_session_request_cancel(v->session);
             ui_tick(v);
         }
+    } else if (strcmp(name, "recover") == 0) {
+        ui_recover(v, false);
     } else if (strcmp(name, "refresh") == 0) {
         ui_refresh(v);
         ui_details(v, 1, 1, NULL);
@@ -220,6 +237,8 @@ static void dropdown_changed(GObject *object, GParamSpec *param, gpointer data)
             g_object_set(settings, "gtk-application-prefer-dark-theme", theme == 2, NULL);
         else
             gtk_settings_reset_property(settings, "gtk-application-prefer-dark-theme");
+    } else if (object == G_OBJECT(v->export_scope)) {
+        ui_controls(v);
     } else if (object == G_OBJECT(v->metric) || object == G_OBJECT(v->cap)) {
         ui_refresh(v);
         ui_details(v, 1, 1, NULL);
@@ -284,10 +303,12 @@ static void dispose_view(gpointer ptr)
     if (v->debounce) g_source_remove(v->debounce);
     if (v->ticker) g_source_remove(v->ticker);
     g_clear_object(&v->detail_task);
+    g_clear_object(&v->volume_task);
     g_clear_object(&v->operation);
     g_clear_object(&v->selection);
     g_clear_object(&v->base);
     ds_session_unref(v->session);
+    ds_recovered_free(v->recovered);
     ds_path_clear(&v->cache);
     ds_path_clear(&v->db);
     ds_details_clear(&v->detail);
@@ -309,6 +330,7 @@ static gboolean close_window(GtkWindow *window, gpointer data)
         v->ticker = 0;
     }
     if (v->detail_task) g_cancellable_cancel(v->detail_task);
+    if (v->volume_task) g_cancellable_cancel(v->volume_task);
     if (v->operation) g_cancellable_cancel(v->operation);
     ds_session_request_cancel(v->session);
     return FALSE;
@@ -327,6 +349,9 @@ static void toolbar(View *v, GtkWidget *root)
     v->save = button(v, bar, UI("저장"), "file", SAVE);
     v->compare = button(v, bar, UI("비교"), "file", COMPARE);
     v->format = dropdown(v, bar, (const char *const[]){"CSV", "JSON", "JSONL", NULL});
+    v->export_scope = dropdown(v, bar, (const char *const[]){
+        UI("전체"), UI("선택 항목"), UI("필터 일치 전체"), NULL});
+    gtk_widget_set_tooltip_text(GTK_WIDGET(v->export_scope), UI("내보낼 결과 범위"));
     v->export = button(v, bar, UI("내보내기"), "file", EXPORT);
     v->theme = dropdown(v, bar, (const char *const[]){UI("시스템 테마"), UI("밝게"), UI("어둡게"), NULL});
 
@@ -367,6 +392,7 @@ static GtkWidget *sidebar(View *v)
     g_signal_connect(v->hide, "toggled", G_CALLBACK(settings_changed), v);
     g_signal_connect(v->exclude, "activate", G_CALLBACK(settings_changed), v);
     button(v, box, UI("캐시 위치"), "file", CACHE);
+    v->recover = button(v, box, UI("최근 캐시 열기"), "recover", 0);
     button(v, box, UI("결과 새로고침"), "refresh", 0);
     v->aggregate = button(v, box, UI("부분 결과 집계"), "aggregate", 0);
     return box;
@@ -421,6 +447,10 @@ static GtkWidget *details(View *v)
     gtk_label_set_wrap(GTK_LABEL(scope), TRUE);
     gtk_label_set_xalign(GTK_LABEL(scope), 0);
     gtk_box_append(GTK_BOX(box), scope);
+    v->volume_label = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(v->volume_label), 0);
+    gtk_label_set_wrap(GTK_LABEL(v->volume_label), TRUE);
+    gtk_box_append(GTK_BOX(box), v->volume_label);
     return scroll(box);
 }
 

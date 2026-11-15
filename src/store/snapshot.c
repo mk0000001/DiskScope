@@ -1,5 +1,6 @@
 #include "diskscope/ds_snapshot.h"
 #include "output.h"
+#include "store_internal.h"
 
 #include <glib/gstdio.h>
 #include <sqlite3.h>
@@ -35,7 +36,7 @@ DsStatus ds_snapshot_save(DsStore *reader, const DsNativePath *destination,
     g_close(output.fd, NULL);
     output.fd = -1;
     sqlite3 *db = NULL;
-    int code = sqlite3_open_v2(output.temporary, &db, SQLITE_OPEN_READWRITE, NULL);
+    int code = sqlite3_open_v2(output.temporary, &db, SQLITE_OPEN_READWRITE, DS_FILE_VFS);
     sqlite3_backup *copy = code == SQLITE_OK ?
         sqlite3_backup_init(db, "main", ds_store_db(reader), "main") : NULL;
     if (copy) {

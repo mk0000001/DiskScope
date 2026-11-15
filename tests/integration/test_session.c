@@ -62,6 +62,9 @@ static void exercise(bool crash)
     char *db = ds_path_arg(ds_session_db_path(s), NULL);
     ds_session_unref(s);
     char *cache = g_path_get_dirname(db);
+    char *lock = g_build_filename(cache, "scan.lock", NULL);
+    g_unlink(lock);
+    g_free(lock);
     g_rmdir(cache);
     g_rmdir(folder);
     g_free(cache);

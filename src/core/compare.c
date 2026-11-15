@@ -225,7 +225,7 @@ static DsStatus save_diff(const DsDiffBatch *batch, void *data, DsError *error)
     if (!batch->count) {
         g_string_printf(line, "{\"type\":\"comparison\",\"schema_version\":%d,"
             "\"same_root\":%s,\"same_policy\":%s,\"before_coverage\":\"%s\",\"after_coverage\":\"%s\"}\n",
-            DS_STORE_SCHEMA_VERSION, batch->same_root ? "true" : "false",
+            DS_JSON_SCHEMA_VERSION, batch->same_root ? "true" : "false",
             batch->same_policy ? "true" : "false",
             batch->before_coverage == DS_COVERAGE_COMPLETE ? "complete" : "partial",
             batch->after_coverage == DS_COVERAGE_COMPLETE ? "complete" : "partial");

@@ -4,7 +4,7 @@
 #include "ds_scan.h"
 
 #define DS_STORE_APPLICATION_ID 0x4453434f
-#define DS_STORE_SCHEMA_VERSION 1
+#define DS_STORE_SCHEMA_VERSION 2
 #define DS_RUN_RUNNING (-1)
 
 typedef struct DsStore DsStore;
@@ -34,6 +34,8 @@ sqlite3 *ds_store_db(DsStore *store);
 /* Set scan options before appending. Appends synchronously commit at most
  * DS_BATCH_MAX observations. The batch and its paths remain caller-owned. */
 DsStatus ds_store_set_options(DsStore *store, const DsScanOptions *options, DsError *error);
+/* Saves the root volume reading once, before appending any observations. */
+DsStatus ds_store_set_volume(DsStore *store, const DsVolumeInfo *volume, DsError *error);
 DsStatus ds_store_set_result(DsStore *store, DsStatus run_status, DsCoverage coverage,
                              DsError *error);
 DsStatus ds_store_append(DsStore *store, const DsEntryBatch *batch, DsError *error);
@@ -45,6 +47,8 @@ DsStatus ds_finalize_result(DsStore *store, DsStatus result, DsCoverage coverage
 /* Outputs own their data. Initialize to {0} and clear after use. */
 DsStatus ds_store_info(DsStore *store, DsStoreInfo *out, DsError *error);
 void ds_store_info_clear(DsStoreInfo *info);
+/* An older store or one without a reading returns DS_OK and captured_at = 0. */
+DsStatus ds_store_volume(DsStore *store, DsVolumeInfo *out, DsError *error);
 DsStatus ds_store_relative_path(DsStore *store, int64_t id, DsNativePath *out, DsError *error);
 
 /* Persistent FIFO of already observed directory IDs. A drained FIFO yields 0. */
