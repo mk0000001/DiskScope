@@ -13,7 +13,7 @@ static BOOL WINAPI console_control(DWORD type)
 {
     if (type != CTRL_C_EVENT && type != CTRL_BREAK_EVENT)
         return FALSE;
-    InterlockedExchange(&interrupted, 1);
+    InterlockedIncrement(&interrupted);
     return TRUE;
 }
 #else
@@ -21,7 +21,7 @@ static volatile sig_atomic_t interrupted;
 static void sigint(int signal_number)
 {
     (void)signal_number;
-    interrupted = 1;
+    if (interrupted < 2) ++interrupted;
 }
 #endif
 
@@ -34,13 +34,18 @@ void ds_cli_interrupt(void)
 #endif
 }
 
-bool ds_cli_interrupted(void)
+unsigned ds_cli_interrupt_count(void)
 {
 #ifdef G_OS_WIN32
-    return InterlockedCompareExchange(&interrupted, 0, 0) != 0;
+    return (unsigned)InterlockedCompareExchange(&interrupted, 0, 0);
 #else
-    return interrupted != 0;
+    return (unsigned)interrupted;
 #endif
+}
+
+bool ds_cli_interrupted(void)
+{
+    return ds_cli_interrupt_count() != 0;
 }
 
 int ds_cli_result(DsStatus status, const DsError *error)
@@ -64,11 +69,17 @@ static int dispatch(int argc, char **argv)
     }
     if (argc == 1 || strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
         g_print("DiskScope " DS_VERSION "\n"
-                "  scan --root PATH --output RESULT.dscan [--profile conservative|standard]\n");
+                "  scan --root PATH --output RESULT.dscan [--profile conservative|standard]\n"
+                "  export --input RESULT.dscan --format csv|json|jsonl --output FILE\n"
+                "  compare --before OLD.dscan --after NEW.dscan --output FILE\n");
         return 0;
     }
     if (strcmp(argv[1], "scan") == 0)
         return ds_cli_scan(argc - 1, argv + 1);
+    if (strcmp(argv[1], "export") == 0)
+        return ds_cli_export(argc - 1, argv + 1);
+    if (strcmp(argv[1], "compare") == 0)
+        return ds_cli_compare(argc - 1, argv + 1);
     return ds_cli_result(DS_INVALID, &(DsError){.message = "Unknown command. Use --help."});
 }
 

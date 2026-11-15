@@ -4,6 +4,7 @@
 #include "protocol.h"
 
 #include <errno.h>
+#include <glib/gstdio.h>
 #include <stdio.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -187,34 +188,37 @@ static DsStatus process(Worker *worker, DsScanOptions *options, DsError *error)
     if (options->profile == DS_CONSERVATIVE)
         lower_priority();
     send_stage(worker, DS_RUNNING);
-    status = ds_walk(options, &worker->control, append, worker, error);
+    /* Ignore all DiskScope artifacts under the configured cache base. */
+    DsScanOptions walk = *options;
+    walk.cache_path = (DsNativePath){0};
+    char *cache_base = g_path_get_dirname(worker->cache);
+    status = ds_path_from_arg(cache_base, &walk.cache_path, error);
+    g_free(cache_base);
+    if (status == DS_OK)
+        status = ds_walk(&walk, &worker->control, append, worker, error);
+    ds_path_clear(&walk.cache_path);
     if (ds_control_canceled(&worker->control) && (status == DS_OK || status == DS_PARTIAL))
         status = DS_CANCELED;
     if (worker->commit_seq)
         committed(worker);
 
+    if (worker->commit_seq && (status == DS_OK || status == DS_PARTIAL)) {
+        if (capacity(worker)) {
+            send_stage(worker, DS_FINALIZING);
+            DsCoverage coverage = status == DS_OK ? DS_COVERAGE_COMPLETE : DS_COVERAGE_PARTIAL;
+            DsStatus finalized = ds_finalize_result(worker->store, status, coverage, &worker->control, error);
+            if (finalized == DS_OK)
+                return status;
+            status = finalized;
+        } else {
+            status = ds_error(error, DS_LIMIT, 0, "Scan cache reserve prevented final aggregation");
+        }
+    }
     DsError terminal = {0};
-    DsCoverage coverage = status == DS_OK ? DS_COVERAGE_COMPLETE : DS_COVERAGE_PARTIAL;
-    DsStatus recorded = ds_store_set_result(worker->store, status, coverage, &terminal);
+    DsStatus recorded = ds_store_set_result(worker->store, status, DS_COVERAGE_PARTIAL, &terminal);
     if (recorded != DS_OK) {
         *error = terminal;
         return recorded;
-    }
-    if (worker->commit_seq && capacity(worker) &&
-        (status == DS_OK || status == DS_PARTIAL || status == DS_CANCELED)) {
-        send_stage(worker, DS_FINALIZING);
-        DsStatus finalized = ds_finalize(worker->store,
-                                         status == DS_CANCELED ? NULL : &worker->control, &terminal);
-        if (finalized != DS_OK) {
-            status = finalized;
-            *error = terminal;
-            recorded = ds_store_set_result(worker->store, status, DS_COVERAGE_PARTIAL, NULL);
-            if (recorded != DS_OK)
-                return recorded;
-        }
-    } else if ((status == DS_OK || status == DS_PARTIAL) && worker->commit_seq) {
-        status = ds_error(error, DS_LIMIT, 0, "Scan cache reserve prevented final aggregation");
-        ds_store_set_result(worker->store, status, DS_COVERAGE_PARTIAL, NULL);
     }
     return status;
 }
@@ -224,16 +228,16 @@ static bool options_from_start(JsonObject *payload, DsScanOptions *options,
 {
     int64_t profile, budget;
     bool hidden;
-    if (!ds_json_int(payload, "profile", &profile) ||
+    if (!ds_ipc_json_int(payload, "profile", &profile) ||
         (profile != DS_STANDARD && profile != DS_CONSERVATIVE) ||
-        !ds_json_int(payload, "cache_budget", &budget) || budget < 0 ||
+        !ds_ipc_json_int(payload, "cache_budget", &budget) || budget < 0 ||
         (uint64_t)budget < 2 * DS_CACHE_END_RESERVE ||
-        !ds_json_bool(payload, "include_hidden", &hidden))
+        !ds_ipc_json_bool(payload, "include_hidden", &hidden))
         return false;
     ds_scan_options_init(options, (DsProfile)profile);
     options->cache_budget = (uint64_t)budget;
     options->include_hidden = hidden;
-    options->exclude_pattern = ds_json_string(payload, "exclude_pattern");
+    options->exclude_pattern = ds_ipc_json_string(payload, "exclude_pattern");
     if (options->exclude_pattern && strlen(options->exclude_pattern) > 1024)
         return false;
     JsonNode *excluded = json_object_get_member(payload, "exclude");
@@ -248,13 +252,13 @@ static bool options_from_start(JsonObject *payload, DsScanOptions *options,
         for (unsigned i = 0; i < count; ++i) {
             JsonNode *entry = json_array_get_element(array, i);
             if (!JSON_NODE_HOLDS_OBJECT(entry) ||
-                !ds_json_path(json_node_get_object(entry), "path", &paths[i], error))
+                !ds_ipc_json_path(json_node_get_object(entry), "path", &paths[i], error))
                 return false;
             ++options->exclude_count;
         }
     }
-    return ds_json_path(payload, "root", &options->root, error) &&
-           ds_json_path(payload, "cache", &options->cache_path, error);
+    return ds_ipc_json_path(payload, "root", &options->root, error) &&
+           ds_ipc_json_path(payload, "cache", &options->cache_path, error);
 }
 
 int main(void)
@@ -313,6 +317,16 @@ int main(void)
     ds_path_clear(&options.cache_path);
     for (size_t i = 0; i < options.exclude_count; ++i)
         ds_path_clear(&exclusions[i]);
+    if (worker.cache && ds_cache_usage(worker.cache) < worker.cache_budget && ds_cache_has_reserve(worker.cache)) {
+        char *log_path = g_build_filename(worker.cache, "diagnostics.txt", NULL);
+        char *summary = g_strdup_printf(
+            "schema=1\nresult=%d\nobservations=%" G_GINT64_FORMAT "\ncommits=%" G_GINT64_FORMAT
+            "\nos_code=%" G_GINT64_FORMAT "\n", result, worker.observations,
+            worker.commit_seq, error.os_code);
+        g_file_set_contents_full(log_path, summary, -1, G_FILE_SET_CONTENTS_CONSISTENT, 0600, NULL);
+        g_free(summary);
+        g_free(log_path);
+    }
     g_free(worker.cache);
     /* stdout was flushed. A blocked command read must not hold stdio shutdown. */
     _Exit(ok ? 0 : 5);

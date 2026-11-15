@@ -24,10 +24,10 @@ GBytes *ds_message_frame(DsMessageType type, const char *scan_id, int64_t sequen
 DsStatus ds_message_parse(const void *data, size_t length, const char *expected_id,
                           int64_t expected_sequence, DsMessage *out, DsError *error);
 void ds_message_clear(DsMessage *message);
-const char *ds_json_string(JsonObject *obj, const char *key);
-bool ds_json_int(JsonObject *obj, const char *key, int64_t *value);
-bool ds_json_bool(JsonObject *obj, const char *key, bool *value);
-bool ds_json_path(JsonObject *obj, const char *key, DsNativePath *path, DsError *error);
-void ds_json_set_path(JsonObject *obj, const char *key, const DsNativePath *path);
+const char *ds_ipc_json_string(JsonObject *obj, const char *key);
+bool ds_ipc_json_int(JsonObject *obj, const char *key, int64_t *value);
+bool ds_ipc_json_bool(JsonObject *obj, const char *key, bool *value);
+bool ds_ipc_json_path(JsonObject *obj, const char *key, DsNativePath *path, DsError *error);
+void ds_ipc_json_set_path(JsonObject *obj, const char *key, const DsNativePath *path);
 
 #endif

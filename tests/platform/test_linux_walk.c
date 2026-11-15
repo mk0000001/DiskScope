@@ -24,7 +24,7 @@ typedef struct {
 
 static enum { REAL_READDIR, UNKNOWN_READDIR, ERROR_READDIR, VANISH_READDIR } enumeration;
 static bool injected;
-static bool replace_before_open, probe_parallelism;
+static bool replace_before_open, mount_changed, probe_parallelism;
 static GMutex operation_lock;
 static GCond operation_changed;
 static unsigned active_operations, peak_operations;
@@ -33,6 +33,11 @@ int __real_linux_open_directory(LinuxOpen *, int, const char *, bool, int);
 int __wrap_linux_open_directory(LinuxOpen *method, int parent, const char *name,
                                 bool same_mount, int mode)
 {
+    if (mount_changed && same_mount && strcmp(name, ".") == 0) {
+        mount_changed = false;
+        errno = EXDEV;
+        return -1;
+    }
     if (replace_before_open && strcmp(name, "swap-me") == 0) {
         replace_before_open = false;
         g_assert_cmpint(renameat(parent, name, parent, "retired"), ==, 0);
@@ -102,6 +107,7 @@ static void setup(Fixture *f, gconstpointer unused)
     enumeration = REAL_READDIR;
     injected = false;
     replace_before_open = false;
+    mount_changed = false;
     probe_parallelism = false;
 }
 
@@ -270,6 +276,50 @@ static void excludes_cache(Fixture *f, gconstpointer unused)
     g_assert_cmpint(close(dir), ==, 0);
 }
 
+static void excludes_root_children(Fixture *f, gconstpointer unused)
+{
+    (void)unused;
+    int dir = fixture_dir(f);
+    make_file(dir, "ignored");
+    g_assert_cmpint(close(dir), ==, 0);
+    f->options.exclude_paths = &f->options.root;
+    f->options.exclude_count = 1;
+    g_assert_cmpint(scan(f), ==, DS_OK);
+    g_assert_cmpuint(f->entries->len, ==, 1);
+    const DsEntry *root = find(f, "");
+    g_assert_nonnull(root);
+    g_assert_cmpint(root->kind, ==, DS_DIRECTORY);
+    g_assert_cmpint(root->reason, ==, DS_REASON_POLICY);
+}
+
+static void excludes_cache_through_alias(Fixture *f, gconstpointer unused)
+{
+    (void)unused;
+    int dir = fixture_dir(f);
+    g_assert_cmpint(mkdirat(dir, "cache", 0700), ==, 0);
+    make_file(dir, "cache/state-wal");
+    g_assert_cmpint(symlinkat("cache", dir, "cache-alias"), ==, 0);
+    g_autofree char *cache = g_build_filename(f->root, "cache-alias", NULL);
+    g_assert_cmpint(ds_path_new(DS_PATH_BYTES, cache, strlen(cache), &f->options.cache_path,
+                               &f->error), ==, DS_OK);
+    g_assert_cmpint(scan(f), ==, DS_OK);
+    g_assert_cmpint(find(f, "cache")->reason, ==, DS_REASON_CACHE);
+    g_assert_null(find(f, "state-wal"));
+    g_assert_cmpint(close(dir), ==, 0);
+}
+
+static void reports_root_mount_race(Fixture *f, gconstpointer unused)
+{
+    (void)unused;
+    mount_changed = true;
+    g_assert_cmpint(scan(f), ==, DS_PARTIAL);
+    g_assert_false(mount_changed);
+    const DsEntry *root = find(f, "");
+    g_assert_nonnull(root);
+    g_assert_cmpint(root->kind, ==, DS_DIRECTORY);
+    g_assert_cmpint(root->reason, ==, DS_REASON_MOUNT);
+}
+
 static void unknown_dirent(Fixture *f, gconstpointer unused)
 {
     (void)unused;
@@ -401,6 +451,9 @@ int main(int argc, char **argv)
     g_test_add("/linux/raw-name", Fixture, NULL, setup, preserves_raw_name, teardown);
     g_test_add("/linux/skips-links-special", Fixture, NULL, setup, skips_links_and_special, teardown);
     g_test_add("/linux/cache", Fixture, NULL, setup, excludes_cache, teardown);
+    g_test_add("/linux/excluded-root", Fixture, NULL, setup, excludes_root_children, teardown);
+    g_test_add("/linux/cache-alias", Fixture, NULL, setup, excludes_cache_through_alias, teardown);
+    g_test_add("/linux/root-mount-race", Fixture, NULL, setup, reports_root_mount_race, teardown);
     g_test_add("/linux/unknown-dirent", Fixture, NULL, setup, unknown_dirent, teardown);
     g_test_add("/linux/readdir-eio", Fixture, NULL, setup, distinguishes_error_from_eof, teardown);
     g_test_add("/linux/vanished", Fixture, NULL, setup, reports_vanished_entry, teardown);

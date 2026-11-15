@@ -226,6 +226,8 @@ static int read_row(sqlite3_stmt *stmt, DsRow *row)
         if (e->kind == DS_FILE) {
             row->metrics[DS_LOGICAL] = e->logical;
             row->metrics[DS_ALLOCATED] = e->allocated;
+            row->unknown[DS_LOGICAL] = e->logical.quality != DS_KNOWN;
+            row->unknown[DS_ALLOCATED] = e->allocated.quality != DS_KNOWN;
         }
     }
     return SQLITE_OK;

@@ -150,6 +150,37 @@ static int scalar(DsStore *store, const char *sql, int64_t *value)
     return rc;
 }
 
+static int match_schema(DsStore *store)
+{
+    static const char sql[] = "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name";
+    sqlite3 *expected = NULL;
+    sqlite3_stmt *actual = NULL, *canonical = NULL;
+    int rc = sqlite3_open(":memory:", &expected);
+    if (rc == SQLITE_OK) rc = sqlite3_exec(expected, schema, NULL, NULL, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_prepare_v2(expected, sql, -1, &canonical, NULL);
+    if (rc == SQLITE_OK) rc = ds_sql_prepare(store, &actual, sql);
+    while (rc == SQLITE_OK) {
+        int source = sqlite3_step(actual), reference = sqlite3_step(canonical);
+        if (source != SQLITE_ROW || reference != SQLITE_ROW) {
+            if (source != SQLITE_DONE || reference != SQLITE_DONE)
+                rc = source != SQLITE_ROW && source != SQLITE_DONE ? source : SQLITE_NOTADB;
+            break;
+        }
+        for (int i = 0; i < 4; ++i) {
+            const char *left = (const char *)sqlite3_column_text(actual, i);
+            const char *right = (const char *)sqlite3_column_text(canonical, i);
+            if (g_strcmp0(left, right) || sqlite3_column_bytes(actual, i) != sqlite3_column_bytes(canonical, i)) {
+                rc = SQLITE_NOTADB;
+                break;
+            }
+        }
+    }
+    sqlite3_finalize(actual);
+    sqlite3_finalize(canonical);
+    sqlite3_close(expected);
+    return rc;
+}
+
 static int open_schema(DsStore *store)
 {
     int64_t application = 0, version = 0, objects = 0, budget = 0;
@@ -163,6 +194,8 @@ static int open_schema(DsStore *store)
         rc = ds_sql_exec(store, schema);
     } else if (application != DS_STORE_APPLICATION_ID || version != DS_STORE_SCHEMA_VERSION) {
         return SQLITE_NOTADB;
+    } else {
+        rc = match_schema(store);
     }
     if (rc == SQLITE_OK) rc = scalar(store, "SELECT cache_budget FROM scans WHERE id=1", &budget);
     if (rc == SQLITE_OK && budget < (128LL << 20)) rc = SQLITE_CORRUPT;
@@ -226,6 +259,10 @@ DsStatus ds_store_open(const DsNativePath *path, DsStoreMode mode,
         rc = enable_wal(store);
         if (rc == SQLITE_OK) rc = ds_sql_exec(store, "PRAGMA synchronous=NORMAL;"
             "PRAGMA wal_autocheckpoint=0; PRAGMA journal_size_limit=16777216;");
+        int64_t page_size = 0;
+        if (rc == SQLITE_OK) rc = scalar(store, "PRAGMA page_size", &page_size);
+        if (rc == SQLITE_OK && (page_size < 512 || page_size > 65536)) rc = SQLITE_CORRUPT;
+        if (rc == SQLITE_OK) store->page_size = (uint64_t)page_size;
     }
     if (rc == SQLITE_OK) rc = ds_query_register_functions(store);
     if (rc != SQLITE_OK) {
@@ -241,6 +278,7 @@ void ds_store_close(DsStore *store)
 {
     if (!store) return;
     sqlite3_close_v2(store->db);
+    g_free(store->cache_directory);
     g_free(store->filename);
     g_free(store);
 }

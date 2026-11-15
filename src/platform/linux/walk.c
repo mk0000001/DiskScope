@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <fnmatch.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -196,11 +197,9 @@ static void note_issue(LinuxWalk *walk, int code)
 
 static void directory_issue(LinuxWalk *walk, const Directory *directory, int code)
 {
-    DsReason reason = errno_reason(code);
-    bool mount = reason == DS_REASON_MOUNT;
-    if (!mount) note_issue(walk, code);
+    note_issue(walk, code);
     emit(walk, directory->id, directory->parent, directory->name,
-         mount ? DS_EXCLUDED : DS_DIRECTORY, reason, code, &directory->metadata);
+         DS_DIRECTORY, errno_reason(code), code, &directory->metadata);
 }
 
 static void close_stream(LinuxWalk *walk, Directory *directory)
@@ -343,9 +342,18 @@ static DsStatus configure_exclusions(LinuxWalk *walk)
     if (walk->options->cache_path.raw) {
         walk->cache_path = linux_canonical_path(&walk->options->cache_path, walk->error);
         if (!walk->cache_path) return DS_INVALID;
+        /* Resolve the explicitly configured output location so a symlinked
+         * cache base cannot conceal the actual directory from the exclusion. */
+        char *resolved = realpath(walk->cache_path, NULL);
+        if (resolved) {
+            g_free(walk->cache_path);
+            walk->cache_path = g_strdup(resolved);
+            free(resolved);
+        }
         if (cache_contains_root(walk->cache_path, walk->root.path))
             return ds_error(walk->error, DS_INVALID, EINVAL, "The scan root is inside the private cache");
-        int fd = linux_open_root(walk->cache_path, &walk->root.method);
+        LinuxOpen cache_method = walk->root.method;
+        int fd = linux_open_root(walk->cache_path, &cache_method);
         if (fd >= 0) {
             walk->cache_identity_known = linux_metadata_at(fd, "", AT_EMPTY_PATH, &walk->cache_identity) == 0;
             close(fd);
@@ -475,7 +483,7 @@ static void enumerate(LinuxWalk *walk)
                       .metadata = walk->root.metadata};
     walk->last_id = 1;
     if (g_hash_table_contains(walk->excluded_paths, walk->root.path)) {
-        emit(walk, 1, 0, "", DS_EXCLUDED, DS_REASON_POLICY, 0, &root.metadata);
+        emit(walk, 1, 0, "", DS_DIRECTORY, DS_REASON_POLICY, 0, &root.metadata);
         g_free(root.name);
         return;
     }

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=DiskScope
+Comment=Read-only disk usage analyzer
+Comment[ko]=읽기 전용 디스크 사용량 분석기
+Exec=diskscope %f
+Icon=drive-harddisk
+Terminal=false
+Categories=Utility;System;FileTools;

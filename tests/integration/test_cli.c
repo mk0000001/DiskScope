@@ -61,6 +61,9 @@ static void scan(void)
             char *child = g_build_filename(cache, name, NULL);
             char *database = g_build_filename(child, "scan.sqlite", NULL);
             g_unlink(database);
+            char *log = g_build_filename(child, "diagnostics.txt", NULL);
+            g_unlink(log);
+            g_free(log);
             g_rmdir(child);
             g_free(database);
             g_free(child);

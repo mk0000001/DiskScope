@@ -1,0 +1,16 @@
+DiskScope program code is distributed under the MIT license.
+
+SQLite is in the public domain. The bundled SQLite 3.54.1 amalgamation comes
+from https://www.sqlite.org/download.html. The release archive hashes are
+listed in docs/DEPENDENCIES.md.
+
+GLib, GIO, GTK and JSON-GLib are used as shared libraries under the
+GNU Lesser General Public License, version 2.1 or later. Cairo is
+dual-licensed under LGPL-2.1-or-later or MPL-1.1. DiskScope uses the shared
+versions from Ubuntu or MSYS2 UCRT64. The Ubuntu package declares its
+shared library dependencies. The Windows portable ZIP contains a separate
+license directory, dependency archive manifest, and source archive
+references. See its companion source ZIP for the pinned MSYS2 source
+archives and package recipes.
+
+Version and license details are in docs/DEPENDENCIES.md.

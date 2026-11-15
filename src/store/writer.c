@@ -1,36 +1,108 @@
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "store_internal.h"
-#include <gio/gio.h>
 #include <glib/gstdio.h>
+#ifdef G_OS_WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <sys/statvfs.h>
+#endif
 
 static uint64_t file_size(const char *path)
 {
     GStatBuf info;
-    return g_stat(path, &info) == 0 && info.st_size > 0 ? (uint64_t)info.st_size : 0;
+    return g_lstat(path, &info) == 0 && info.st_size > 0 ? (uint64_t)info.st_size : 0;
+}
+
+static uint64_t cache_size(DsStore *store, uint64_t database)
+{
+    if (store->cache_directory) {
+        GDir *directory = g_dir_open(store->cache_directory, 0, NULL);
+        if (!directory) return UINT64_MAX;
+        uint64_t total = 0;
+        const char *basename;
+        while ((basename = g_dir_read_name(directory))) {
+            char *path = g_build_filename(store->cache_directory, basename, NULL);
+            uint64_t size = file_size(path);
+            g_free(path);
+            if (!ds_u64_add(total, size, &total)) {
+                total = UINT64_MAX;
+                break;
+            }
+        }
+        g_dir_close(directory);
+        return total;
+    }
+    char *wal = g_strconcat(store->filename, "-wal", NULL);
+    char *shm = g_strconcat(store->filename, "-shm", NULL);
+    uint64_t total;
+    bool fits = ds_u64_add(database, file_size(wal), &total) &&
+        ds_u64_add(total, file_size(shm), &total);
+    g_free(wal);
+    g_free(shm);
+    return fits ? total : UINT64_MAX;
+}
+
+static int project_commit(DsStore *store, uint64_t database, uint64_t *size)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc = ds_sql_prepare(store, &stmt, "PRAGMA page_count");
+    uint64_t committed = 0;
+    if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        int64_t pages = sqlite3_column_int64(stmt, 0);
+        rc = pages > 0 && ds_u64_mul((uint64_t)pages, store->page_size, &committed)
+            ? SQLITE_OK : SQLITE_FULL;
+    }
+    sqlite3_finalize(stmt);
+    int cache_bytes = 0, unused = 0;
+    if (rc == SQLITE_OK)
+        rc = sqlite3_db_status(store->db, SQLITE_DBSTATUS_CACHE_USED, &cache_bytes, &unused, 0);
+    if (rc != SQLITE_OK) return rc;
+    uint64_t checkpoint_growth = committed > database ? committed - database : 0;
+    /* The resident page cache bounds SQLite's unflushed pages. WAL bytes
+     * already spilled to disk are included in size. A checkpoint may grow
+     * the main DB while those WAL frames still occupy space. */
+    return cache_bytes >= 0 && ds_u64_add(*size, (uint64_t)cache_bytes, size) &&
+        ds_u64_add(*size, checkpoint_growth, size) ? SQLITE_OK : SQLITE_FULL;
+}
+
+static int check_free_space(const char *directory, uint64_t reserve)
+{
+#ifdef G_OS_WIN32
+    wchar_t *wide = (wchar_t *)g_utf8_to_utf16(directory, -1, NULL, NULL, NULL);
+    ULARGE_INTEGER available;
+    bool ok = wide && GetDiskFreeSpaceExW(wide, &available, NULL, NULL);
+    g_free(wide);
+    if (!ok) return SQLITE_IOERR_FSTAT;
+    return available.QuadPart >= reserve ? SQLITE_OK : SQLITE_FULL;
+#else
+    struct statvfs space;
+    if (statvfs(directory, &space) || !space.f_frsize) return SQLITE_IOERR_FSTAT;
+    uint64_t blocks = reserve / space.f_frsize + (reserve % space.f_frsize != 0);
+    return space.f_bavail >= blocks ? SQLITE_OK : SQLITE_FULL;
+#endif
 }
 
 int ds_store_check_budget(DsStore *store, bool collecting)
 {
-    char *wal = g_strconcat(store->filename, "-wal", NULL);
-    char *shm = g_strconcat(store->filename, "-shm", NULL);
-    uint64_t size = file_size(store->filename);
-    bool fits = ds_u64_add(size, file_size(wal), &size) &&
-        ds_u64_add(size, file_size(shm), &size) &&
-        size < store->budget - (collecting ? DS_CACHE_END_RESERVE : 0);
-    g_free(wal);
-    g_free(shm);
-    if (!fits) return SQLITE_FULL;
-
-    char *parent = g_path_get_dirname(store->filename);
-    GFile *dir = g_file_new_for_path(parent);
-    GFileInfo *info = g_file_query_filesystem_info(dir, G_FILE_ATTRIBUTE_FILESYSTEM_FREE, NULL, NULL);
-    if (info && g_file_info_has_attribute(info, G_FILE_ATTRIBUTE_FILESYSTEM_FREE)) {
-        uint64_t free_space = g_file_info_get_attribute_uint64(info, G_FILE_ATTRIBUTE_FILESYSTEM_FREE);
-        fits = free_space >= (collecting ? DS_CACHE_FREE_RESERVE : DS_CACHE_END_RESERVE);
+    uint64_t database = file_size(store->filename);
+    uint64_t size = cache_size(store, database);
+    bool in_transaction = sqlite3_get_autocommit(store->db) == 0;
+    if (in_transaction) {
+        int rc = project_commit(store, database, &size);
+        if (rc != SQLITE_OK) return rc;
     }
-    g_clear_object(&info);
-    g_object_unref(dir);
+    uint64_t threshold = store->budget - DS_CACHE_END_RESERVE - (UINT64_C(64) << 10);
+    if (size >= threshold) return SQLITE_FULL;
+
+    uint64_t reserve = collecting || !in_transaction ? DS_CACHE_FREE_RESERVE : DS_CACHE_END_RESERVE;
+    char *parent = g_path_get_dirname(store->filename);
+    int rc = check_free_space(parent, reserve);
     g_free(parent);
-    return fits ? SQLITE_OK : SQLITE_FULL;
+    return rc;
 }
 
 void ds_store_checkpoint(DsStore *store)
@@ -71,6 +143,21 @@ static char *make_policy(const DsScanOptions *options)
     return policy;
 }
 
+static char *managed_cache(DsStore *store, const DsNativePath *path)
+{
+    if (!path->raw) return NULL;
+    char *arg = ds_path_arg(path, NULL);
+    if (!arg) return NULL;
+    char *directory = g_canonicalize_filename(arg, NULL);
+    char *database = g_canonicalize_filename(store->filename, NULL);
+    char *parent = g_path_get_dirname(database);
+    if (strcmp(directory, parent)) g_clear_pointer(&directory, g_free);
+    g_free(parent);
+    g_free(database);
+    g_free(arg);
+    return directory;
+}
+
 DsStatus ds_store_set_options(DsStore *store, const DsScanOptions *options, DsError *error)
 {
     if (!store || store->mode != DS_STORE_WRITER || !options || !options->root.raw ||
@@ -91,7 +178,9 @@ DsStatus ds_store_set_options(DsStore *store, const DsScanOptions *options, DsEr
     if (status != DS_OK) return status;
     char *policy = make_policy(options);
     uint64_t old_budget = store->budget;
+    char *old_cache = store->cache_directory;
     store->budget = budget;
+    store->cache_directory = managed_cache(store, &options->cache_path);
     int rc = ds_store_check_budget(store, true);
     sqlite3_stmt *statement = NULL;
     if (rc == SQLITE_OK) rc = ds_sql_prepare(store, &statement, "UPDATE scans SET"
@@ -105,7 +194,13 @@ DsStatus ds_store_set_options(DsStore *store, const DsScanOptions *options, DsEr
     if (rc == SQLITE_OK) rc = ds_sql_step_done(statement);
     if (rc == SQLITE_OK && sqlite3_changes(store->db) != 1) rc = SQLITE_CONSTRAINT;
     sqlite3_finalize(statement);
-    if (rc != SQLITE_OK) store->budget = old_budget;
+    if (rc != SQLITE_OK) {
+        store->budget = old_budget;
+        g_free(store->cache_directory);
+        store->cache_directory = old_cache;
+    } else {
+        g_free(old_cache);
+    }
     g_free(policy);
     g_free(display);
     return ds_sql_status(store, rc, error);
@@ -201,9 +296,15 @@ DsStatus ds_store_append(DsStore *store, const DsEntryBatch *batch, DsError *err
         (batch->count && !batch->entries) || batch->count > DS_BATCH_MAX)
         return ds_error(error, DS_INVALID, 0, "Invalid entry batch or store mode");
     if (!batch->count) return DS_OK;
-    for (size_t i = 0; i < batch->count; ++i)
+    size_t payload = batch->count * sizeof(DsEntry);
+    for (size_t i = 0; i < batch->count; ++i) {
         if (!valid_entry(&batch->entries[i]))
             return ds_error(error, DS_INVALID, 0, "Invalid entry at batch index %" G_GSIZE_FORMAT, i);
+        size_t length = g_bytes_get_size(batch->entries[i].name.raw);
+        if (length > DS_QUEUE_BYTES - payload)
+            return ds_error(error, DS_LIMIT, 0, "Entry batch exceeds the memory budget");
+        payload += length;
+    }
 
     int rc = ds_store_check_budget(store, true);
     if (rc == SQLITE_OK) rc = ds_sql_exec(store, "BEGIN IMMEDIATE");
@@ -258,6 +359,7 @@ DsStatus ds_store_append(DsStore *store, const DsEntryBatch *batch, DsError *err
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(metadata, 2, added);
     if (rc == SQLITE_OK) rc = ds_sql_step_done(metadata);
     sqlite3_finalize(metadata);
+    if (rc == SQLITE_OK) rc = ds_store_check_budget(store, true);
     if (rc == SQLITE_OK) rc = ds_sql_exec(store, "COMMIT");
     if (rc != SQLITE_OK) {
         DsStatus status = ds_sql_status(store, rc, error);

@@ -171,7 +171,8 @@ static int finish_generation(DsStore *store, int64_t generation)
     return rc;
 }
 
-DsStatus ds_finalize(DsStore *store, DsControl *control, DsError *error)
+static DsStatus finalize(DsStore *store, int result, DsCoverage coverage,
+                         DsControl *control, DsError *error)
 {
     if (!store || store->mode != DS_STORE_WRITER)
         return ds_error(error, DS_INVALID, 0, "A writable store is required for aggregation");
@@ -180,6 +181,13 @@ DsStatus ds_finalize(DsStore *store, DsControl *control, DsError *error)
     int rc = ds_store_check_budget(store, false);
     if (rc == SQLITE_OK) rc = ds_sql_exec(store, "BEGIN IMMEDIATE");
     if (rc != SQLITE_OK) return ds_sql_status(store, rc, error);
+    if (result != DS_RUN_RUNNING) {
+        DsStatus status = ds_store_set_result(store, (DsStatus)result, coverage, error);
+        if (status != DS_OK) {
+            ds_sql_exec(store, "ROLLBACK");
+            return status;
+        }
+    }
     if (control) sqlite3_progress_handler(store->db, 1000, ds_sql_interrupt, control);
     int64_t generation = 0;
     rc = start_generation(store, &generation);
@@ -197,4 +205,15 @@ DsStatus ds_finalize(DsStore *store, DsControl *control, DsError *error)
     }
     ds_store_checkpoint(store);
     return DS_OK;
+}
+
+DsStatus ds_finalize(DsStore *store, DsControl *control, DsError *error)
+{
+    return finalize(store, DS_RUN_RUNNING, DS_COVERAGE_PARTIAL, control, error);
+}
+
+DsStatus ds_finalize_result(DsStore *store, DsStatus result, DsCoverage coverage,
+                             DsControl *control, DsError *error)
+{
+    return finalize(store, result, coverage, control, error);
 }

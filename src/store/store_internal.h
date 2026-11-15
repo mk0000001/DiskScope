@@ -7,8 +7,10 @@
 struct DsStore {
     sqlite3 *db;
     char *filename;
+    char *cache_directory;
     DsStoreMode mode;
     uint64_t budget;
+    uint64_t page_size;
 };
 
 DsStatus ds_sql_status(DsStore *store, int code, DsError *error);

@@ -4,6 +4,19 @@
 #include <glib/gstdio.h>
 #include <sqlite3.h>
 
+static bool has_sidecar(const char *path)
+{
+    const char *const suffixes[] = {"-wal", "-shm", "-journal"};
+    for (size_t i = 0; i < G_N_ELEMENTS(suffixes); ++i) {
+        char *sidecar = g_strconcat(path, suffixes[i], NULL);
+        bool exists = g_file_test(sidecar, G_FILE_TEST_EXISTS | G_FILE_TEST_IS_SYMLINK);
+        g_free(sidecar);
+        if (exists)
+            return true;
+    }
+    return false;
+}
+
 DsStatus ds_snapshot_save(DsStore *reader, const DsNativePath *destination,
                           DsControl *control, DsError *error)
 {
@@ -15,6 +28,10 @@ DsStatus ds_snapshot_save(DsStore *reader, const DsNativePath *destination,
     DsStatus status = ds_output_begin(reader, destination, &output, error);
     if (status != DS_OK)
         return status;
+    if (has_sidecar(output.destination)) {
+        ds_output_clear(&output);
+        return ds_error(error, DS_INVALID, 0, "Snapshot destination has an existing SQLite journal");
+    }
     g_close(output.fd, NULL);
     output.fd = -1;
     sqlite3 *db = NULL;
@@ -52,6 +69,8 @@ DsStatus ds_snapshot_save(DsStore *reader, const DsNativePath *destination,
     else if (code != SQLITE_OK)
         status = ds_error(error, code == SQLITE_FULL ? DS_LIMIT : DS_IO, code,
                           "SQLite could not complete the snapshot");
+    else if (has_sidecar(output.destination))
+        status = ds_error(error, DS_INVALID, 0, "Snapshot destination acquired a SQLite journal");
     else
         status = ds_output_commit(&output, error);
     ds_output_clear(&output);

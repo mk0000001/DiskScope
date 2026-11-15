@@ -13,11 +13,18 @@ typedef struct {
 } Directory;
 
 typedef struct {
+    DsEntry entry;
+    WCHAR *path;
+    WIN32_FIND_DATAW found;
+} MetadataJob;
+
+typedef struct {
     const DsScanOptions *options;
     DsControl *control;
     DsEntrySink sink;
     void *sink_data;
     DsError *error;
+    const DsWinMetadataOps *file_ops;
     GPatternSpec *pattern;
     GPtrArray *exclude_paths;
     WCHAR *cache_path;
@@ -29,6 +36,11 @@ typedef struct {
     int64_t batch_start;
     size_t batch_count;
     DsEntry *batch;
+    GThread *helper;
+    GAsyncQueue *requests, *results;
+    MetadataJob job;
+    bool pending;
+    bool ntfs;
     bool partial;
 } Walker;
 
@@ -74,6 +86,62 @@ static DsStatus emit(Walker *w, const DsEntry *entry)
     queued->name.raw = g_bytes_ref(entry->name.raw);
     if (w->batch_count == DS_BATCH_MAX) return flush(w);
     return DS_OK;
+}
+
+static gpointer metadata_helper(void *data)
+{
+    Walker *w = data;
+    for (;;) {
+        void *request = g_async_queue_pop(w->requests);
+        if (request == w) return NULL;
+        MetadataJob *job = request;
+        ds_win_measure_file(w->file_ops, job->path, &w->root, &job->found, &job->entry);
+        g_async_queue_push(w->results, job);
+    }
+}
+
+static void start_helper(Walker *w)
+{
+    if (w->options->profile != DS_STANDARD || w->options->jobs < 2) return;
+    w->requests = g_async_queue_new();
+    w->results = g_async_queue_new();
+    w->helper = g_thread_try_new("metadata", metadata_helper, w, NULL);
+}
+
+static void clear_job(Walker *w)
+{
+    ds_path_clear(&w->job.entry.name);
+    g_clear_pointer(&w->job.path, g_free);
+    w->pending = false;
+}
+
+static void stop_helper(Walker *w)
+{
+    if (w->helper) {
+        g_async_queue_push(w->requests, w);
+        g_thread_join(w->helper);
+    }
+    if (w->pending) clear_job(w);
+    g_clear_pointer(&w->requests, g_async_queue_unref);
+    g_clear_pointer(&w->results, g_async_queue_unref);
+}
+
+static DsStatus collect_metadata(Walker *w)
+{
+    if (!w->pending) return DS_OK;
+    const MetadataJob *job = g_async_queue_pop(w->results);
+    DsStatus status = emit(w, &job->entry);
+    clear_job(w);
+    return status;
+}
+
+static bool boundary_requested(DsControl *control)
+{
+    if (!control) return false;
+    g_mutex_lock(&control->lock);
+    const bool requested = control->pause || control->cancel;
+    g_mutex_unlock(&control->lock);
+    return requested;
 }
 
 static bool same_path(const WCHAR *left, const WCHAR *right)
@@ -134,7 +202,10 @@ static DsStatus inspect_root(Walker *w)
             DsWinVolume volume;
             error = ds_win_volume_info(handle, w->path, &volume);
             if (!error && !supported_filesystem(volume.filesystem)) error = ERROR_NOT_SUPPORTED;
-            if (!error) w->root = node;
+            if (!error) {
+                w->root = node;
+                w->ntfs = wcscmp(volume.filesystem, L"NTFS") == 0;
+            }
         }
         if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
         if (error) {
@@ -162,15 +233,21 @@ static void reserve_search(Walker *w)
     }
 }
 
+static DWORD compare_directory(const Walker *w, const DsWinNode *expected, const DsWinNode *actual)
+{
+    if (!w->ntfs && (!expected->id_known || !actual->id_known)) return ERROR_NOT_SUPPORTED;
+    return ds_win_same_node(expected, actual) ? ERROR_SUCCESS : ERROR_FILE_INVALID;
+}
+
 static DWORD search_directory(Walker *w, Directory *directory, WIN32_FIND_DATAW *found)
 {
     HANDLE before = INVALID_HANDLE_VALUE, after = INVALID_HANDLE_VALUE;
     DsWinNode first, second;
     DWORD error = open_directory(w->path, &before, &first);
     if (error == ERROR_FILE_NOT_FOUND) error = ERROR_PATH_NOT_FOUND;
+    if (!error && !w->ntfs && !first.id_known) error = ERROR_NOT_SUPPORTED;
     if (!error && !ds_win_same_volume(&w->root, &first)) error = ERROR_NOT_SAME_DEVICE;
-    if (!error && directory->observed && !ds_win_same_node(&directory->node, &first))
-        error = ERROR_FILE_INVALID;
+    if (!error && directory->observed) error = compare_directory(w, &directory->node, &first);
     if (!error && directory->cursor && directory->node.legacy_known && first.legacy_known &&
         CompareFileTime(&directory->node.legacy.ftLastWriteTime, &first.legacy.ftLastWriteTime) != 0)
         error = ERROR_FILE_INVALID;
@@ -189,9 +266,10 @@ static DWORD search_directory(Walker *w, Directory *directory, WIN32_FIND_DATAW 
         }
     }
     if (!error || error == ERROR_FILE_NOT_FOUND) {
-        const DWORD recheck = open_directory(w->path, &after, &second);
-        if (recheck || !ds_win_same_node(&first, &second))
-            error = !recheck || recheck == ERROR_FILE_NOT_FOUND ? ERROR_FILE_INVALID : recheck;
+        DWORD recheck = open_directory(w->path, &after, &second);
+        if (!recheck) recheck = compare_directory(w, &first, &second);
+        if (recheck)
+            error = recheck == ERROR_FILE_NOT_FOUND ? ERROR_FILE_INVALID : recheck;
         else
             directory->node = first;
     }
@@ -231,8 +309,8 @@ static DWORD check_return_path(Walker *w, Directory *directory)
     HANDLE handle = INVALID_HANDLE_VALUE;
     DsWinNode current;
     DWORD error = open_directory(w->path, &handle, &current);
-    if (error == ERROR_FILE_NOT_FOUND || (!error && !ds_win_same_node(&directory->node, &current)))
-        error = ERROR_FILE_INVALID;
+    if (error == ERROR_FILE_NOT_FOUND) error = ERROR_FILE_INVALID;
+    if (!error) error = compare_directory(w, &directory->node, &current);
     if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
     return error;
 }
@@ -267,7 +345,13 @@ static DsStatus observe_child(Walker *w, Directory *directory, const WIN32_FIND_
             entry.kind = DS_EXCLUDED;
             entry.reason = DS_REASON_LIMIT;
         } else if (entry.kind == DS_FILE) {
-            ds_win_measure_file(&ds_win_metadata_ops, child, &w->root, found, &entry);
+            if (w->helper) {
+                w->job = (MetadataJob){.entry = entry, .path = child, .found = *found};
+                w->pending = true;
+                g_async_queue_push(w->requests, &w->job);
+                return DS_OK;
+            }
+            ds_win_measure_file(w->file_ops, child, &w->root, found, &entry);
         }
     }
 
@@ -299,7 +383,13 @@ static DsStatus enumerate(Walker *w)
     status = emit(w, &root.entry);
 
     while (status == DS_OK && w->directories->len) {
-        if (!ds_control_checkpoint(w->control)) return DS_CANCELED;
+        /* Let a file query overlap the next cursor advancement. Drain the
+         * helper before acknowledging a pause or delivering the next entry. */
+        if (w->pending && boundary_requested(w->control)) {
+            status = collect_metadata(w);
+            if (status != DS_OK) return status;
+        }
+        if (!w->pending && !ds_control_checkpoint(w->control)) return DS_CANCELED;
         if (w->batch_count && g_get_monotonic_time() - w->batch_start >= DS_BATCH_MSEC * 1000) {
             status = flush(w);
             if (status != DS_OK) return status;
@@ -318,6 +408,11 @@ static DsStatus enumerate(Walker *w)
             if (directory->cursor) error = check_return_path(w, directory);
             if (!error) error = next_entry(directory->find, &found);
         }
+        if (w->pending) {
+            status = collect_metadata(w);
+            if (status != DS_OK) return status;
+            if (!ds_control_checkpoint(w->control)) return DS_CANCELED;
+        }
         g_clear_pointer(&directory->cursor, g_bytes_unref);
         if (error == ERROR_NO_MORE_FILES || error == ERROR_FILE_NOT_FOUND) {
             pop_directory(w);
@@ -325,6 +420,7 @@ static DsStatus enumerate(Walker *w)
             DsReason reason = ds_win_error_reason(error, DS_REASON_IO);
             if (error == ERROR_NOT_SAME_DEVICE) reason = DS_REASON_MOUNT;
             else if (error == ERROR_FILE_INVALID || error == ERROR_DIRECTORY) reason = DS_REASON_CHANGED;
+            else if (error == ERROR_NOT_SUPPORTED) reason = DS_REASON_METADATA;
             directory->entry.reason = reason;
             directory->entry.os_code = error;
             status = emit(w, &directory->entry);
@@ -336,15 +432,16 @@ static DsStatus enumerate(Walker *w)
     return status;
 }
 
-DsStatus ds_walk(const DsScanOptions *options, DsControl *control, DsEntrySink sink,
-                 void *sink_data, DsError *error)
+DsStatus ds_win_walk_with_metadata_ops(const DsScanOptions *options, DsControl *control,
+                                       DsEntrySink sink, void *sink_data, DsError *error,
+                                       const DsWinMetadataOps *file_ops)
 {
     if (!options || !sink || (options->exclude_count && !options->exclude_paths) ||
         (options->exclude_pattern && !g_utf8_validate(options->exclude_pattern, -1, NULL)))
         return ds_error(error, DS_INVALID, 0, "Invalid Windows scan options or callback");
 
     Walker w = {.options = options, .control = control, .sink = sink, .sink_data = sink_data,
-                .error = error};
+                .error = error, .file_ops = file_ops};
     DWORD code;
     w.path = ds_win_absolute_path(&options->root, &code);
     if (!w.path)
@@ -365,7 +462,11 @@ DsStatus ds_walk(const DsScanOptions *options, DsControl *control, DsEntrySink s
         status = ds_error(error, DS_INVALID, code, "Invalid Windows exclusion path or cache root");
     else
         status = inspect_root(&w);
-    if (status == DS_OK) status = enumerate(&w);
+    if (status == DS_OK) {
+        start_helper(&w);
+        status = enumerate(&w);
+    }
+    stop_helper(&w);
     if (status == DS_OK || status == DS_CANCELED) {
         const DsStatus delivered = flush(&w);
         if (delivered != DS_OK) status = delivered;
@@ -380,4 +481,11 @@ DsStatus ds_walk(const DsScanOptions *options, DsControl *control, DsEntrySink s
     g_free(w.path);
     if (status == DS_OK && w.partial) return DS_PARTIAL;
     return status;
+}
+
+DsStatus ds_walk(const DsScanOptions *options, DsControl *control, DsEntrySink sink,
+                 void *sink_data, DsError *error)
+{
+    return ds_win_walk_with_metadata_ops(options, control, sink, sink_data, error,
+                                         &ds_win_metadata_ops);
 }

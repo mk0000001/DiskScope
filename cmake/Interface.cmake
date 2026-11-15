@@ -1,0 +1,45 @@
+target_sources(ds_store PRIVATE src/store/validate.c src/core/compare.c
+    src/export/csv.c src/export/json.c)
+target_sources(diskscope-cli PRIVATE src/cli/results.c)
+
+if(BUILD_TESTING)
+    foreach(test snapshot export compare resource_failures)
+        ds_test(integration.${test} tests/integration/test_${test}.c)
+        target_link_libraries(test_integration_${test} PRIVATE ds_store)
+    endforeach()
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_definitions(test_integration_resource_failures PRIVATE DS_TEST_WRAP_WRITE)
+        target_link_options(test_integration_resource_failures PRIVATE -Wl,--wrap=write)
+    endif()
+endif()
+
+if(DS_GUI)
+    add_library(ds_paged STATIC src/ui/paged_model.c)
+    target_include_directories(ds_paged PUBLIC src/ui)
+    target_link_libraries(ds_paged PUBLIC ds_store)
+    ds_c_target(ds_paged)
+    target_sources(ds_core PRIVATE src/core/statistics.c)
+
+    add_executable(diskscope WIN32 src/ui/main.c src/ui/window.c src/ui/jobs.c
+        src/ui/explorer.c src/ui/details.c src/ui/settings.c ${ds_manifest})
+    if(WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
+        target_link_options(diskscope PRIVATE -mwindows)
+    endif()
+    target_compile_definitions(diskscope PRIVATE
+        GTK_VERSION_MIN_REQUIRED=GTK_VERSION_4_14 GTK_VERSION_MAX_ALLOWED=GTK_VERSION_4_14)
+    target_link_libraries(diskscope PRIVATE ds_session ds_paged PkgConfig::GTK)
+    ds_c_target(diskscope)
+    install(TARGETS diskscope RUNTIME DESTINATION bin)
+
+    if(BUILD_TESTING)
+        ds_test(ui.model tests/ui/test_paged_model.c)
+        target_link_libraries(test_ui_model PRIVATE ds_paged)
+        set_tests_properties(ui.model PROPERTIES TIMEOUT 150)
+    endif()
+endif()
+
+if(BUILD_TESTING)
+    add_executable(diskscope-benchmark EXCLUDE_FROM_ALL tests/perf/benchmark.c)
+    target_link_libraries(diskscope-benchmark PRIVATE ds_store)
+    ds_c_target(diskscope-benchmark)
+endif()

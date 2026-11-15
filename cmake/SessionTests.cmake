@@ -1,0 +1,13 @@
+if(BUILD_TESTING)
+    set(ds_mock_dir "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/mock-session")
+    ds_test(integration.session tests/integration/test_session.c)
+    target_link_libraries(test_integration_session PRIVATE ds_session)
+    set_target_properties(test_integration_session PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${ds_mock_dir}")
+    add_executable(ds_mock_worker tests/helpers/mock_worker.c)
+    target_link_libraries(ds_mock_worker PRIVATE ds_protocol)
+    ds_c_target(ds_mock_worker)
+    set_target_properties(ds_mock_worker PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${ds_mock_dir}" OUTPUT_NAME "diskscope-worker")
+    add_dependencies(test_integration_session ds_mock_worker)
+    set_tests_properties(integration.session PROPERTIES TIMEOUT 25)
+endif()

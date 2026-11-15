@@ -244,6 +244,87 @@ static void resume_deep_ancestors(void)
     g_assert_cmpuint(counts.found, ==, counts.expected);
 }
 
+static GThread *enumerating_thread;
+static DsControl *helper_control;
+static gint helper_operations;
+static gint metadata_active;
+
+static HANDLE WINAPI measure_on_helper(LPCWSTR path, DWORD access, DWORD share,
+                                        LPSECURITY_ATTRIBUTES attrs, DWORD disposition,
+                                        DWORD flags, HANDLE template)
+{
+    if (g_thread_self() != enumerating_thread) {
+        g_atomic_int_set(&metadata_active, 1);
+        if (g_atomic_int_add(&helper_operations, 1) == 0) ds_control_pause(helper_control, true);
+    }
+    return CreateFileW(path, access, share, attrs, disposition, flags, template);
+}
+
+static BOOL WINAPI close_helper_handle(HANDLE file)
+{
+    const BOOL closed = CloseHandle(file);
+    g_atomic_int_set(&metadata_active, 0);
+    return closed;
+}
+
+static void acknowledge_helper_pause(bool paused, void *data)
+{
+    if (!paused) return;
+    unsigned *pauses = data;
+    g_assert_cmpint(g_atomic_int_get(&metadata_active), ==, 0);
+    ++*pauses;
+    ds_control_pause(helper_control, false);
+}
+
+static void standard_profile_metadata_helper(void)
+{
+    WCHAR *dir = fixture_directory();
+    if (!dir) return;
+    WCHAR *first = fixture_path(dir, L"alpha.bin");
+    WCHAR *second = fixture_path(dir, L"zeta.bin");
+    g_assert_true(CloseHandle(fixture_open(first, CREATE_NEW)));
+    g_assert_true(CloseHandle(fixture_open(second, CREATE_NEW)));
+
+    DsScanOptions options;
+    fixture_set_root(&options, dir);
+    options.profile = DS_STANDARD;
+    options.jobs = 2;
+    DsWinMetadataOps ops = ds_win_metadata_ops;
+    ops.open = measure_on_helper;
+    ops.close = close_helper_handle;
+    enumerating_thread = g_thread_self();
+    g_atomic_int_set(&helper_operations, 0);
+    g_atomic_int_set(&metadata_active, 0);
+    unsigned pauses = 0;
+    DsControl control;
+    ds_control_init(&control);
+    control.pause_changed = acknowledge_helper_pause;
+    control.pause_data = &pauses;
+    helper_control = &control;
+    Observations found = {g_hash_table_new_full(g_bytes_hash, g_bytes_equal,
+                                               (GDestroyNotify)g_bytes_unref, g_free), 0};
+    DsError error = {0};
+    DsStatus status = ds_win_walk_with_metadata_ops(&options, &control, collect, &found, &error, &ops);
+    g_test_message("Standard walk status %d: %s", status, error.message);
+    ds_control_clear(&control);
+    helper_control = NULL;
+    ds_path_clear(&options.root);
+    g_assert_true(DeleteFileW(first));
+    g_assert_true(DeleteFileW(second));
+    g_assert_true(RemoveDirectoryW(dir));
+    g_free(first);
+    g_free(second);
+    g_free(dir);
+
+    g_assert_cmpint(status, ==, DS_OK);
+    g_assert_cmpuint(g_hash_table_size(found.entries), ==, 3);
+    g_assert_cmpint(g_atomic_int_get(&helper_operations), ==, 2);
+    g_assert_cmpuint(pauses, ==, 1);
+    g_assert_cmpint(observed(&found, L"alpha.bin")->allocated.quality, ==, DS_KNOWN);
+    g_assert_cmpint(observed(&found, L"zeta.bin")->allocated.quality, ==, DS_KNOWN);
+    g_hash_table_unref(found.entries);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -251,5 +332,6 @@ int main(int argc, char **argv)
     g_test_add_func("/windows/walk/drive-root-pattern", drive_root_pattern);
     g_test_add_func("/windows/walk/placeholder-attributes", cloud_and_offline_classification);
     g_test_add_func("/windows/walk/deep-ancestors", resume_deep_ancestors);
+    g_test_add_func("/windows/walk/standard-metadata-helper", standard_profile_metadata_helper);
     return g_test_run();
 }

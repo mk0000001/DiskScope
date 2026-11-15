@@ -34,3 +34,26 @@ From PowerShell with the UCRT64 runtime on PATH during development:
 ```
 
 Use a small disposable folder for smoke testing. A scan uses ordinary metadata APIs, which still invoke the operating system and its storage stack.
+
+## Build the Ubuntu package
+
+```sh
+cmake --preset release
+cmake --build --preset release
+ctest --preset release
+cpack --config build/release/CPackConfig.cmake -G DEB
+sudo apt install ./diskscope_0.1.0_amd64.deb
+diskscope
+```
+
+The Windows bundle and matching source archive are built with the [portable packaging procedure](../packaging/windows/README.md).
+
+## CLI result workflows
+
+```sh
+diskscope-cli scan --root ./fixture --output result.dscan --json
+diskscope-cli export --input result.dscan --format jsonl --output report.jsonl
+diskscope-cli compare --before old.dscan --after result.dscan --output changes.jsonl
+```
+
+Use `--cache-dir` to choose another local cache base. The CLI accepts `--hide-hidden`, an optional basename `--exclude-pattern`, and repeatable `--exclude-path` options. A cancellation request can still produce a committed partial snapshot. A second Ctrl+C during backup cancels its publication. Exit codes are 0 for success, 2 for gaps, 3 for cancellation, 4 for invalid usage/input, and 5 for worker, I/O or resource failure.

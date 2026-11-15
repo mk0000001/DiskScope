@@ -44,5 +44,7 @@ void ds_win_measure_file(const DsWinMetadataOps *ops, const WCHAR *path,
 bool ds_win_same_volume(const DsWinNode *a, const DsWinNode *b);
 bool ds_win_same_node(const DsWinNode *a, const DsWinNode *b);
 DWORD ds_win_volume_info(HANDLE root, const WCHAR *absolute_path, DsWinVolume *volume);
+DsStatus ds_win_walk_with_metadata_ops(const DsScanOptions *, DsControl *, DsEntrySink, void *,
+                                       DsError *, const DsWinMetadataOps *);
 
 #endif

@@ -98,13 +98,13 @@ static JsonNode *typed_value(JsonObject *obj, const char *key, GType type)
     return n && JSON_NODE_HOLDS_VALUE(n) && json_node_get_value_type(n) == type ? n : NULL;
 }
 
-const char *ds_json_string(JsonObject *obj, const char *key)
+const char *ds_ipc_json_string(JsonObject *obj, const char *key)
 {
     JsonNode *n = typed_value(obj, key, G_TYPE_STRING);
     return n ? json_node_get_string(n) : NULL;
 }
 
-bool ds_json_int(JsonObject *obj, const char *key, int64_t *value)
+bool ds_ipc_json_int(JsonObject *obj, const char *key, int64_t *value)
 {
     JsonNode *n = typed_value(obj, key, G_TYPE_INT64);
     if (!n)
@@ -113,7 +113,7 @@ bool ds_json_int(JsonObject *obj, const char *key, int64_t *value)
     return true;
 }
 
-bool ds_json_bool(JsonObject *obj, const char *key, bool *value)
+bool ds_ipc_json_bool(JsonObject *obj, const char *key, bool *value)
 {
     JsonNode *n = typed_value(obj, key, G_TYPE_BOOLEAN);
     if (!n)
@@ -132,16 +132,16 @@ DsStatus ds_message_parse(const void *data, size_t length, const char *expected_
     JsonNode *root = json_parser_get_root(parser);
     JsonObject *obj = valid && root && JSON_NODE_HOLDS_OBJECT(root) ? json_node_get_object(root) : NULL;
     int64_t version = 0, sequence = 0;
-    const char *id = ds_json_string(obj, "scan_id");
-    const char *type = ds_json_string(obj, "type");
+    const char *id = ds_ipc_json_string(obj, "scan_id");
+    const char *type = ds_ipc_json_string(obj, "type");
     JsonNode *payload = obj ? json_object_get_member(obj, "payload") : NULL;
     DsMessageType found = DS_MSG_COUNT;
     for (unsigned i = 0; i < G_N_ELEMENTS(types); ++i)
         if (type && strcmp(types[i], type) == 0)
             found = (DsMessageType)i;
     valid = obj && json_object_get_size(obj) == 5 &&
-            ds_json_int(obj, "protocol_version", &version) && version == 1 &&
-            ds_json_int(obj, "sequence", &sequence) && sequence > 0 &&
+            ds_ipc_json_int(obj, "protocol_version", &version) && version == 1 &&
+            ds_ipc_json_int(obj, "sequence", &sequence) && sequence > 0 &&
             sequence == expected_sequence && id && g_uuid_string_is_valid(id) &&
             (!expected_id || strcmp(id, expected_id) == 0) &&
             found != DS_MSG_COUNT && payload && JSON_NODE_HOLDS_OBJECT(payload);
@@ -159,14 +159,14 @@ void ds_message_clear(DsMessage *message)
     g_clear_pointer(&message->payload, json_object_unref);
 }
 
-bool ds_json_path(JsonObject *obj, const char *key, DsNativePath *path, DsError *error)
+bool ds_ipc_json_path(JsonObject *obj, const char *key, DsNativePath *path, DsError *error)
 {
     JsonNode *node = json_object_get_member(obj, key);
     JsonObject *raw = node && JSON_NODE_HOLDS_OBJECT(node) ? json_node_get_object(node) : NULL;
-    const char *text = ds_json_string(raw, "base64");
+    const char *text = ds_ipc_json_string(raw, "base64");
     int64_t encoding;
     if (!text || strlen(text) > ((DS_PATH_MAX + 2) / 3) * 4 ||
-        !ds_json_int(raw, "encoding", &encoding) ||
+        !ds_ipc_json_int(raw, "encoding", &encoding) ||
         (encoding != DS_PATH_BYTES && encoding != DS_PATH_UTF16LE)) {
         ds_error(error, DS_PROTOCOL, 0, "Malformed IPC path");
         return false;
@@ -181,7 +181,7 @@ bool ds_json_path(JsonObject *obj, const char *key, DsNativePath *path, DsError 
     return valid;
 }
 
-void ds_json_set_path(JsonObject *obj, const char *key, const DsNativePath *path)
+void ds_ipc_json_set_path(JsonObject *obj, const char *key, const DsNativePath *path)
 {
     size_t size;
     const uint8_t *raw = g_bytes_get_data(path->raw, &size);

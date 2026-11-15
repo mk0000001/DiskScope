@@ -38,6 +38,9 @@ DsStatus ds_store_set_result(DsStore *store, DsStatus run_status, DsCoverage cov
                              DsError *error);
 DsStatus ds_store_append(DsStore *store, const DsEntryBatch *batch, DsError *error);
 DsStatus ds_finalize(DsStore *store, DsControl *control, DsError *error);
+/* Atomically publishes the aggregate generation and terminal run metadata. */
+DsStatus ds_finalize_result(DsStore *store, DsStatus result, DsCoverage coverage,
+                             DsControl *control, DsError *error);
 
 /* Outputs own their data. Initialize to {0} and clear after use. */
 DsStatus ds_store_info(DsStore *store, DsStoreInfo *out, DsError *error);

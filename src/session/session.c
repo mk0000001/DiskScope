@@ -134,7 +134,7 @@ static bool handle_event(DsSession *s, const DsMessage *message, bool *hello, bo
 {
     int64_t stage, seq, total, result;
     bool valid = false;
-    const char *detail = ds_json_string(message->payload, "detail");
+    const char *detail = ds_ipc_json_string(message->payload, "detail");
     if (detail && strlen(detail) >= sizeof s->event.detail)
         return false;
     g_mutex_lock(&s->lock);
@@ -144,7 +144,7 @@ static bool handle_event(DsSession *s, const DsMessage *message, bool *hello, bo
     } else if (!*finished) {
         switch (message->type) {
         case DS_MSG_STATUS:
-            valid = ds_json_int(message->payload, "stage", &stage) &&
+            valid = ds_ipc_json_int(message->payload, "stage", &stage) &&
                     (stage == DS_RUNNING || stage == DS_PAUSED || stage == DS_FINALIZING);
             if (valid && !s->cancel) {
                 DsStage next = (DsStage)stage;
@@ -156,8 +156,8 @@ static bool handle_event(DsSession *s, const DsMessage *message, bool *hello, bo
             }
             break;
         case DS_MSG_COMMITTED:
-            valid = ds_json_int(message->payload, "commit_seq", &seq) && seq > s->event.commit_seq &&
-                    ds_json_int(message->payload, "observations", &total) && total >= 0 &&
+            valid = ds_ipc_json_int(message->payload, "commit_seq", &seq) && seq > s->event.commit_seq &&
+                    ds_ipc_json_int(message->payload, "observations", &total) && total >= 0 &&
                     (uint64_t)total >= s->event.observations;
             if (valid) {
                 s->event.commit_seq = seq;
@@ -166,10 +166,12 @@ static bool handle_event(DsSession *s, const DsMessage *message, bool *hello, bo
             }
             break;
         case DS_MSG_FINISHED:
-            valid = ds_json_int(message->payload, "result", &result) && result >= DS_OK &&
+            valid = ds_ipc_json_int(message->payload, "result", &result) && result >= DS_OK &&
                     result <= DS_PROTOCOL;
             if (valid) {
                 *finished = true;
+                s->stopping = true;
+                g_cond_signal(&s->changed);
                 s->event.result = (DsStatus)result;
             }
             break;
@@ -186,18 +188,30 @@ static bool handle_event(DsSession *s, const DsMessage *message, bool *hello, bo
     return valid;
 }
 
-static void recover_observations(DsSession *s)
+static bool reconcile_cache(DsSession *s, int result, DsError *error)
 {
-    if (!s->event.commit_seq)
-        return;
     DsStore *store = NULL;
-    if (ds_store_open(&s->db, DS_STORE_WRITER, &store, NULL) == DS_OK) {
-        DsStoreInfo info = {0};
-        if (ds_store_info(store, &info, NULL) == DS_OK && info.run_status == DS_RUN_RUNNING)
-            ds_store_set_result(store, DS_IO, DS_COVERAGE_PARTIAL, NULL);
-        ds_store_info_clear(&info);
-        ds_store_close(store);
+    DsStoreInfo info = {0};
+    if (ds_store_open(&s->db, DS_STORE_READER, &store, NULL) != DS_OK)
+        return true;  /* A worker may have exited before it created the DB. */
+    bool read = ds_store_info(store, &info, NULL) == DS_OK;
+    ds_store_close(store);
+    if (!read)
+        return true;
+    g_mutex_lock(&s->lock);
+    s->event.commit_seq = info.commit_seq;
+    s->event.observations = info.entry_count;
+    g_mutex_unlock(&s->lock);
+    bool ok = true;
+    if (result != DS_RUN_RUNNING && info.run_status != result) {
+        ok = ds_store_open(&s->db, DS_STORE_WRITER, &store, error) == DS_OK;
+        if (ok) {
+            ok = ds_store_set_result(store, (DsStatus)result, DS_COVERAGE_PARTIAL, error) == DS_OK;
+            ds_store_close(store);
+        }
     }
+    ds_store_info_clear(&info);
+    return ok;
 }
 
 static gpointer receive_events(gpointer ptr)
@@ -242,8 +256,13 @@ static gpointer receive_events(gpointer ptr)
     g_mutex_unlock(&s->lock);
     bool normal = g_subprocess_wait(s->child, NULL, NULL) &&
                   g_subprocess_get_successful(s->child) && valid && hello && finished;
-    if (!normal)
-        recover_observations(s);
+    g_mutex_lock(&s->lock);
+    bool late_cancel = normal && s->cancel &&
+                       (s->event.result == DS_OK || s->event.result == DS_PARTIAL);
+    g_mutex_unlock(&s->lock);
+    DsError recovery = {0};
+    bool reconciled = reconcile_cache(s, !normal ? DS_IO : late_cancel ? DS_CANCELED : DS_RUN_RUNNING,
+                                      &recovery);
     g_mutex_lock(&s->lock);
     s->event.exited = true;
     if (!normal) {
@@ -253,11 +272,13 @@ static gpointer receive_events(gpointer ptr)
                    "Worker sent invalid IPC", sizeof s->event.detail);
     } else {
         s->event.stage = DS_FINISHED;
-        if (s->cancel && (s->event.result == DS_OK || s->event.result == DS_PARTIAL))
-            s->event.result = DS_CANCELED;
+        if (late_cancel)
+            s->event.result = reconciled ? DS_CANCELED : recovery.status;
+        if (!reconciled)
+            g_strlcpy(s->event.detail, recovery.message, sizeof s->event.detail);
     }
-    g_mutex_unlock(&s->lock);
     g_atomic_int_set(&active_scan, 0);
+    g_mutex_unlock(&s->lock);
     notify(s);
     ds_session_unref(s);
     return NULL;
@@ -267,8 +288,8 @@ static JsonObject *start_payload(const DsScanOptions *options, const DsNativePat
                                 const DsNativePath *cache)
 {
     JsonObject *data = json_object_new();
-    ds_json_set_path(data, "root", root);
-    ds_json_set_path(data, "cache", cache);
+    ds_ipc_json_set_path(data, "root", root);
+    ds_ipc_json_set_path(data, "cache", cache);
     json_object_set_int_member(data, "profile", options->profile);
     json_object_set_int_member(data, "cache_budget", (gint64)options->cache_budget);
     json_object_set_boolean_member(data, "include_hidden", options->include_hidden);
@@ -278,7 +299,7 @@ static JsonObject *start_payload(const DsScanOptions *options, const DsNativePat
         JsonArray *paths = json_array_new();
         for (size_t i = 0; i < options->exclude_count; ++i) {
             JsonObject *item = json_object_new();
-            ds_json_set_path(item, "path", &options->exclude_paths[i]);
+            ds_ipc_json_set_path(item, "path", &options->exclude_paths[i]);
             json_array_add_object_element(paths, item);
         }
         json_object_set_array_member(data, "exclude", paths);
