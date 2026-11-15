@@ -1,0 +1,8 @@
+add_library(ds_protocol STATIC src/session/protocol.c)
+target_include_directories(ds_protocol PUBLIC src/session)
+target_link_libraries(ds_protocol PUBLIC ds_core PkgConfig::JSON)
+ds_c_target(ds_protocol)
+if(BUILD_TESTING)
+    ds_test(integration.protocol tests/integration/test_protocol.c)
+    target_link_libraries(test_integration_protocol PRIVATE ds_protocol)
+endif()

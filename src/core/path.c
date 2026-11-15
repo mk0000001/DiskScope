@@ -113,7 +113,7 @@ char *ds_path_arg(const DsNativePath *path, DsError *error)
         char *utf8 = g_utf16_to_utf8(units, (glong)(length / 2), NULL, NULL, NULL);
         g_free(units);
         if (!utf8)
-            ds_error(error, DS_UNSUPPORTED, 0, "Path cannot be sent through a UTF-8 API");
+            ds_error(error, DS_INVALID, 0, "Path cannot be sent through a UTF-8 API");
         return utf8;
     }
 #else

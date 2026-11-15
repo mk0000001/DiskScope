@@ -1,0 +1,255 @@
+#include "windows_fixture.h"
+
+#include <string.h>
+
+typedef struct {
+    GHashTable *entries;
+    int64_t last_id;
+} Observations;
+
+static DsStatus collect(const DsEntryBatch *batch, void *data, DsError *error)
+{
+    (void)error;
+    Observations *observations = data;
+    g_assert_cmpuint(batch->count, <=, DS_BATCH_MAX);
+    for (size_t i = 0; i < batch->count; ++i) {
+        const DsEntry *entry = &batch->entries[i];
+        g_assert_cmpint(entry->parent_id, <, entry->id);
+        g_assert_cmpint(entry->name.encoding, ==, DS_PATH_UTF16LE);
+        DsEntry *record = g_new(DsEntry, 1);
+        *record = *entry;
+        record->name = (DsNativePath){0};
+        if (!g_hash_table_contains(observations->entries, entry->name.raw)) {
+            g_assert_cmpint(entry->id, >, observations->last_id);
+            observations->last_id = entry->id;
+        }
+        g_hash_table_replace(observations->entries, g_bytes_ref(entry->name.raw), record);
+    }
+    return DS_OK;
+}
+
+static const DsEntry *observed(const Observations *observations, const WCHAR *name)
+{
+    GBytes *key = g_bytes_new_static(name, wcslen(name) * sizeof(*name));
+    const DsEntry *result = g_hash_table_lookup(observations->entries, key);
+    g_bytes_unref(key);
+    return result;
+}
+
+static bool create_junction(const WCHAR *path, const WCHAR *target)
+{
+    typedef struct {
+        DWORD tag;
+        WORD data_length, reserved, substitute_offset, substitute_length, print_offset, print_length;
+        WCHAR names[1024];
+    } MountReparseData;
+    g_assert_true(CreateDirectoryW(path, NULL));
+    HANDLE handle = CreateFileW(path, GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
+                                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    g_assert_true(handle != INVALID_HANDLE_VALUE);
+    MountReparseData reparse = { .tag = IO_REPARSE_TAG_MOUNT_POINT };
+    int substitute_chars = swprintf(reparse.names, G_N_ELEMENTS(reparse.names),
+                                    L"\\??\\%ls", target + 4);
+    g_assert_cmpint(substitute_chars, >, 0);
+    const size_t print_chars = wcslen(target + 4);
+    const size_t print_start = (size_t)substitute_chars + 1;
+    g_assert_cmpuint(print_start + print_chars, <, G_N_ELEMENTS(reparse.names));
+    memcpy(reparse.names + print_start, target + 4, (print_chars + 1) * sizeof(WCHAR));
+    reparse.substitute_length = (WORD)(substitute_chars * sizeof(WCHAR));
+    reparse.print_offset = (WORD)(print_start * sizeof(WCHAR));
+    reparse.print_length = (WORD)(print_chars * sizeof(WCHAR));
+    const DWORD length = (DWORD)(offsetof(MountReparseData, names) +
+                                 (print_start + print_chars + 1) * sizeof(WCHAR));
+    reparse.data_length = (WORD)(length - 8);
+    DWORD returned;
+    const BOOL success = DeviceIoControl(handle, FSCTL_SET_REPARSE_POINT, &reparse, length,
+                                         NULL, 0, &returned, NULL);
+    g_assert_true(CloseHandle(handle));
+    if (!success) g_assert_true(RemoveDirectoryW(path));
+    return success != FALSE;
+}
+
+static void scan_local_fixture(void)
+{
+    WCHAR *dir = fixture_directory();
+    if (!dir) return;
+    WCHAR *outside = fixture_directory();
+    WCHAR *foreign = fixture_path(outside, L"outside-scan.bin");
+    g_assert_true(CloseHandle(fixture_open(foreign, CREATE_NEW)));
+
+    const WCHAR long_component[] =
+        L"another-directory-name-long-enough-to-ensure-the-full-path-passes-legacy-win32-path-limits-"
+        L"while-the-component-itself-is-within-the-ntfs-component-length-1234567890";
+    WCHAR *sub1 = fixture_path(dir, long_component);
+    WCHAR *sub2 = fixture_path(sub1, long_component);
+    const WCHAR unicode_name[] = L"\uD55C\uAE00-\U0001F680.bin";
+    WCHAR *unicode = fixture_path(sub2, unicode_name);
+    WCHAR *duplicate = fixture_path(dir, L"hardlink.bin");
+    WCHAR *junction = fixture_path(dir, L"junction");
+    WCHAR *hidden = fixture_path(dir, L"hidden.bin");
+    WCHAR *exclude = fixture_path(dir, L"ignore.tmp");
+    g_assert_cmpuint(wcslen(unicode), >, 260);
+    g_assert_true(CreateDirectoryW(sub1, NULL));
+    g_assert_true(CreateDirectoryW(sub2, NULL));
+    HANDLE file = fixture_open(unicode, CREATE_NEW);
+    fixture_write(file);
+    g_assert_true(CloseHandle(file));
+    g_assert_true(CreateHardLinkW(duplicate, unicode, NULL));
+    const bool junction_created = create_junction(junction, outside);
+    g_assert_true(CloseHandle(fixture_open(hidden, CREATE_NEW)));
+    g_assert_true(SetFileAttributesW(hidden, FILE_ATTRIBUTE_HIDDEN));
+    g_assert_true(CloseHandle(fixture_open(exclude, CREATE_NEW)));
+
+    DsScanOptions options;
+    fixture_set_root(&options, dir);
+    options.include_hidden = false;
+    options.exclude_pattern = "*.tmp";
+    DsControl control;
+    ds_control_init(&control);
+    Observations found = {g_hash_table_new_full(g_bytes_hash, g_bytes_equal,
+                                               (GDestroyNotify)g_bytes_unref, g_free), 0};
+    DsError error = {0};
+    DsStatus status = ds_walk(&options, &control, collect, &found, &error);
+    g_test_message("walk status %d: %s", status, error.message);
+    g_assert_cmpint(status, ==, DS_OK);
+    const DsEntry *root = observed(&found, L"");
+    g_assert_nonnull(root);
+    g_assert_cmpint(root->id, ==, 1);
+    g_assert_cmpint(root->kind, ==, DS_DIRECTORY);
+    const DsEntry *a = observed(&found, unicode_name);
+    const DsEntry *b = observed(&found, L"hardlink.bin");
+    g_assert_nonnull(a);
+    g_assert_nonnull(b);
+    g_assert_cmpint(a->kind, ==, DS_FILE);
+    g_assert_cmpint(a->logical.quality, ==, DS_KNOWN);
+    g_assert_cmpuint(a->logical.bytes, ==, 4096);
+    g_assert_cmpint(a->allocated.quality, ==, DS_KNOWN);
+    g_assert_cmpuint(a->allocated.bytes, ==, b->allocated.bytes);
+    g_assert_true(a->identity_known && b->identity_known);
+    g_assert_cmpmem(a->identity, sizeof(a->identity), b->identity, sizeof(b->identity));
+    g_assert_cmpuint(a->links, ==, 2);
+    g_assert_cmpuint(b->links, ==, 2);
+    g_assert_cmpint(observed(&found, L"hidden.bin")->reason, ==, DS_REASON_POLICY);
+    g_assert_cmpint(observed(&found, L"ignore.tmp")->reason, ==, DS_REASON_POLICY);
+    g_assert_null(observed(&found, L"outside-scan.bin"));
+    if (junction_created) {
+        const DsEntry *link = observed(&found, L"junction");
+        g_assert_nonnull(link);
+        g_assert_cmpint(link->kind, ==, DS_LINK);
+        g_assert_cmpint(link->reason, ==, DS_REASON_LINK);
+        g_assert_false(link->identity_known);
+
+        ds_path_clear(&options.root);
+        fixture_set_root(&options, junction);
+        g_assert_cmpint(ds_walk(&options, &control, collect, &found, &error), ==, DS_INVALID);
+        g_assert_true(RemoveDirectoryW(junction));
+    } else {
+        g_test_message("junction setup unavailable; the junction assertions were skipped");
+    }
+    g_hash_table_unref(found.entries);
+    ds_control_clear(&control);
+    ds_path_clear(&options.root);
+
+    g_assert_true(DeleteFileW(duplicate));
+    g_assert_true(DeleteFileW(unicode));
+    g_assert_true(DeleteFileW(exclude));
+    g_assert_true(DeleteFileW(hidden));
+    g_assert_true(RemoveDirectoryW(sub2));
+    g_assert_true(RemoveDirectoryW(sub1));
+    g_assert_true(RemoveDirectoryW(dir));
+    g_assert_true(DeleteFileW(foreign));
+    g_assert_true(RemoveDirectoryW(outside));
+    g_free(exclude);
+    g_free(hidden);
+    g_free(junction);
+    g_free(duplicate);
+    g_free(unicode);
+    g_free(sub2);
+    g_free(sub1);
+    g_free(foreign);
+    g_free(outside);
+    g_free(dir);
+}
+
+static void drive_root_pattern(void)
+{
+    DsNativePath value = {0};
+    const WCHAR drive[] = L"C:";
+    g_assert_cmpint(ds_path_new(DS_PATH_UTF16LE, drive, sizeof(drive) - sizeof(WCHAR),
+                               &value, NULL), ==, DS_OK);
+    DWORD error = ERROR_SUCCESS;
+    WCHAR *absolute = ds_win_absolute_path(&value, &error);
+    g_assert_nonnull(absolute);
+    g_assert_cmpint(wcscmp(absolute, L"\\\\?\\C:\\"), ==, 0);
+    WCHAR *pattern = ds_win_join(absolute, L"*");
+    g_assert_cmpint(wcscmp(pattern, L"\\\\?\\C:\\*"), ==, 0);
+    g_free(pattern);
+    g_free(absolute);
+    ds_path_clear(&value);
+}
+
+static void cloud_and_offline_classification(void)
+{
+    g_assert_cmpint(ds_win_classify(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT,
+                                   0x9000301aUL), ==, DS_REASON_PLACEHOLDER);
+    g_assert_cmpint(ds_win_classify(FILE_ATTRIBUTE_OFFLINE, 0), ==, DS_REASON_PLACEHOLDER);
+    g_assert_cmpint(ds_win_classify(0x00040000UL, 0), ==, DS_REASON_PLACEHOLDER);
+    g_assert_cmpint(ds_win_classify(0x00400000UL, 0), ==, DS_REASON_PLACEHOLDER);
+    g_assert_cmpint(ds_win_classify(FILE_ATTRIBUTE_REPARSE_POINT, 0x90000042UL), ==, DS_REASON_LINK);
+}
+
+typedef struct { size_t found, expected; } FileCounts;
+
+static DsStatus count_files(const DsEntryBatch *batch, void *data, DsError *error)
+{
+    FileCounts *counts = data;
+    for (size_t i = 0; i < batch->count; ++i)
+        if (batch->entries[i].kind == DS_FILE) ++counts->found;
+    if (counts->found > counts->expected)
+        return ds_error(error, DS_INVALID, 0, "A directory cursor visited a file more than once");
+    return DS_OK;
+}
+
+static void resume_deep_ancestors(void)
+{
+    WCHAR *dir = fixture_directory();
+    if (!dir) return;
+    WCHAR *directories[DS_DIR_HANDLES + 6] = {dir};
+    for (size_t i = 1; i < G_N_ELEMENTS(directories); ++i) {
+        directories[i] = fixture_path(directories[i - 1], L"alpha");
+        g_assert_true(CreateDirectoryW(directories[i], NULL));
+    }
+    for (size_t i = 0; i < G_N_ELEMENTS(directories); ++i) {
+        WCHAR *file = fixture_path(directories[i], L"zeta.bin");
+        g_assert_true(CloseHandle(fixture_open(file, CREATE_NEW)));
+        g_free(file);
+    }
+
+    DsScanOptions options;
+    fixture_set_root(&options, dir);
+    DsError error = {0};
+    FileCounts counts = {.expected = G_N_ELEMENTS(directories)};
+    DsStatus status = ds_walk(&options, NULL, count_files, &counts, &error);
+    g_test_message("deep walk status %d: %s", status, error.message);
+    ds_path_clear(&options.root);
+
+    for (size_t i = G_N_ELEMENTS(directories); i-- > 0;) {
+        WCHAR *file = fixture_path(directories[i], L"zeta.bin");
+        g_assert_true(DeleteFileW(file));
+        g_assert_true(RemoveDirectoryW(directories[i]));
+        g_free(file);
+        g_free(directories[i]);
+    }
+    g_assert_cmpint(status, ==, DS_OK);
+    g_assert_cmpuint(counts.found, ==, counts.expected);
+}
+
+int main(int argc, char **argv)
+{
+    g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/windows/walk/local-ntfs", scan_local_fixture);
+    g_test_add_func("/windows/walk/drive-root-pattern", drive_root_pattern);
+    g_test_add_func("/windows/walk/placeholder-attributes", cloud_and_offline_classification);
+    g_test_add_func("/windows/walk/deep-ancestors", resume_deep_ancestors);
+    return g_test_run();
+}
