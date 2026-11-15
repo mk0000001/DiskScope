@@ -11,6 +11,8 @@
 | Cache retention | Fixtures cover age, count, byte budget, newest recoverable cache, live leases, cancellation, foreign and linked directories, unknown files, and atomic replacement of the primary file. The GTK smoke checks that displayed private imports keep a lease until the app exits. |
 | Diagnostic report | Integration tests cover default redaction, root opt-in, environment-only output, cancellation preserving the destination, and source database protection. The real GTK save dialog in the extracted Ubuntu package wrote both the redacted and root-enabled JSON. The only changed JSON fields were `paths_redacted` and `scan.root`. |
 
+The 0.1.2 DEB uses Linux-native packaging staging. Its executable and directory modes are 0755, and the desktop entry and license documents are 0644. The previously published 0.1.1 DEB carried 0777 modes from its WSL staging filesystem. Use 0.1.2 for Ubuntu deployments.
+
 ### GUI interaction and memory
 
 A 0.1.2 Release build ran on Ubuntu 24.04.4 WSL 1, i7-10700K, GTK 4.14.5 with Cairo at GDK scale 1, and Xvfb at 1440×1000×24 and 96 DPI. The synthetic SQLite result has 1,000,001 rows including the root, 420,585,472 bytes, and SHA-256 `703c6c496edcabcd11fba29f7c41954aebc6795bf895f3d13b9f444321692aca`. The app was timed from launch through the first painted root row, then from XTest clicks or the last search digit through the expected AT-SPI row and its painted pixels. The startup import warmed the cache. There were 20 samples per interaction and the table uses nearest-rank quantiles.

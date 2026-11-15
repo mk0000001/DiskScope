@@ -41,10 +41,14 @@ Use a small disposable folder for smoke testing. A scan uses ordinary metadata A
 cmake --preset release
 cmake --build --preset release
 ctest --preset release
-cpack --config build/release/CPackConfig.cmake -G DEB
+stage=$(mktemp -d)
+cpack --config build/release/CPackConfig.cmake -G DEB -B "$stage"
+cp -- "$stage/diskscope_0.1.2_amd64.deb" .
 sudo apt install ./diskscope_0.1.2_amd64.deb
 diskscope
 ```
+
+Keep the CPack staging directory on a native Linux filesystem. On WSL, use a Linux path such as `/tmp` to preserve installed modes. Copy the finished DEB to the distribution directory after packaging. Files in the DEB should reserve write permissions for the owner.
 
 The Windows bundle and matching source archive are built with the [portable packaging procedure](../packaging/windows/README.md).
 

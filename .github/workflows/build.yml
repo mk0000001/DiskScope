@@ -22,9 +22,12 @@ jobs:
       - run: dbus-run-session -- bash tests/ui/desktop-smoke.sh build/dev/bin wayland
       - name: Install and exercise the DEB on a fresh Ubuntu runtime
         run: |
+          set -euo pipefail
           cmake --preset release -DBUILD_TESTING=OFF
           cmake --build --preset release --parallel 4
           cpack --config build/release/CPackConfig.cmake -G DEB -B build/ci-deb
+          dpkg-deb -c build/ci-deb/diskscope_*_amd64.deb |
+            awk 'substr($1,6,1) == "w" || substr($1,9,1) == "w" {print; bad=1} END {exit bad}'
           docker run --rm --platform linux/amd64 \
             --mount "type=bind,src=$PWD/build/ci-deb,dst=/packages,readonly" \
             --mount "type=bind,src=$PWD/tests/ui,dst=/tests,readonly" \
