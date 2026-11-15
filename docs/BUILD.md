@@ -43,8 +43,8 @@ cmake --build --preset release
 ctest --preset release
 stage=$(mktemp -d)
 cpack --config build/release/CPackConfig.cmake -G DEB -B "$stage"
-cp -- "$stage/diskscope_0.1.2_amd64.deb" .
-sudo apt install ./diskscope_0.1.2_amd64.deb
+cp -- "$stage/diskscope_0.1.3_amd64.deb" .
+sudo apt install ./diskscope_0.1.3_amd64.deb
 diskscope
 ```
 
@@ -64,6 +64,10 @@ diskscope-cli compare --before old.dscan --after result.dscan --output changes.j
 Use `--cache-dir` to choose another local cache base. The CLI accepts `--hide-hidden`, an optional basename `--exclude-pattern`, and repeatable `--exclude-path` options. A cancellation request can still produce a committed partial snapshot. A second Ctrl+C during backup cancels its publication. Exit codes are 0 for success, 2 for gaps, 3 for cancellation, 4 for invalid usage/input, and 5 for worker, I/O or resource failure.
 
 The export entry ID comes from a JSON or JSONL export. Selecting a file writes that row. Selecting a folder writes its row and all descendants. In the GUI, **필터 일치 전체** exports every row matching the active inputs and view type, including matches beyond the Top 100/1000 display cap. The selected metric is recorded alongside all three metric values.
+
+## Retry a Windows access denial
+
+Select an access-denied file or folder in **오류·제외** and choose **관리자 재확인 명령 복사**. Open PowerShell as an administrator and paste the copied command. For a file, PowerShell displays metadata for the selected path. For a folder, the DiskScope CLI scans the selected directory and prints the path of a temporary `.dscan` that can be opened with **결과 열기**. Windows may still deny access to a protected item. The GUI and normal scans run with the launching user's privileges.
 
 ## Cache and diagnostics
 

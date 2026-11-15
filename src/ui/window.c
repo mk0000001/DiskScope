@@ -1,4 +1,77 @@
 #include "ui.h"
+#ifdef G_OS_WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+static bool can_retry_admin(const View *v)
+{
+    return v->detail.path.raw && v->export_selection == v->selected &&
+           v->selected_reason == DS_REASON_PERMISSION && v->selected_os_code == ERROR_ACCESS_DENIED &&
+           (v->selected_kind == DS_FILE || v->selected_kind == DS_DIRECTORY);
+}
+
+static char *powershell_path(const DsNativePath *path)
+{
+    if (!path->raw || path->encoding != DS_PATH_UTF16LE)
+        return NULL;
+    gsize size = 0;
+    const guchar *data = g_bytes_get_data(path->raw, &size);
+    g_autofree char *encoded = g_base64_encode(data, size);
+    /* Keep native path bytes outside PowerShell syntax, including quote
+     * characters in a filename obtained from an imported snapshot. */
+    return g_strdup_printf("([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('%s')))", encoded);
+}
+
+static void retry_admin(View *v)
+{
+    if (!can_retry_admin(v))
+        return;
+    g_autofree char *native = ds_path_arg(&v->detail.path, NULL);
+    const char *path = native && g_str_has_prefix(native, "\\\\?\\") ? native + 4 : native;
+    if (!path || strlen(path) < 4 || !g_ascii_isalpha(path[0]) || path[1] != ':' || path[2] != '\\' ||
+        strchr(path + 2, ':')) {
+        ui_message(v, UI("로컬 파일이나 폴더를 선택하세요"), NULL);
+        return;
+    }
+    g_autofree char *command = NULL;
+    if (v->selected_kind == DS_DIRECTORY) {
+        g_autofree char *target = powershell_path(&v->detail.path);
+        WCHAR module[32768];
+        DWORD units = GetModuleFileNameW(NULL, module, G_N_ELEMENTS(module));
+        g_autofree char *image = units && units < G_N_ELEMENTS(module) ?
+            g_utf16_to_utf8((const gunichar2 *)module, units, NULL, NULL, NULL) : NULL;
+        g_autofree char *folder = image ? g_path_get_dirname(image) : NULL;
+        g_autofree char *cli = folder ? g_build_filename(folder, "diskscope-cli.exe", NULL) : NULL;
+        DsNativePath executable = {0};
+        if (ds_path_from_arg(cli, &executable, NULL) != DS_OK) {
+            ui_message(v, UI("DiskScope CLI 경로를 확인할 수 없습니다"), NULL);
+            return;
+        }
+        g_autofree char *tool = powershell_path(&executable);
+        ds_path_clear(&executable);
+        command = g_strdup_printf(
+            "$diskScopeResult = [IO.Path]::Combine([IO.Path]::GetTempPath(), "
+            "'diskscope-retry-' + [Guid]::NewGuid().ToString('N') + '.dscan'); "
+            "& %s scan --root %s --output $diskScopeResult; "
+            "if (Test-Path -LiteralPath $diskScopeResult) { $diskScopeResult }", tool, target);
+    } else {
+        g_autofree char *extended = g_strconcat("\\\\?\\", path, NULL);
+        DsNativePath literal = {0};
+        if (ds_path_from_arg(extended, &literal, NULL) != DS_OK)
+            return;
+        g_autofree char *target = powershell_path(&literal);
+        ds_path_clear(&literal);
+        command = g_strdup_printf(
+            "Microsoft.PowerShell.Management\\Get-Item -LiteralPath %s -Force | "
+            "Microsoft.PowerShell.Utility\\Select-Object FullName,Length,Attributes,LastWriteTime", target);
+    }
+    gdk_clipboard_set_text(gtk_widget_get_clipboard(GTK_WIDGET(v->window)), command);
+    ui_message(v, UI("선택 항목의 재확인 명령을 복사했습니다"),
+        v->selected_kind == DS_DIRECTORY ?
+        UI("PowerShell을 관리자 권한으로 열고 붙여넣으세요. 출력된 .dscan 경로를 결과 열기에서 선택하세요.") :
+        UI("PowerShell을 관리자 권한으로 열고 붙여넣으면 선택한 파일의 메타데이터를 확인할 수 있습니다."));
+}
+#endif
 
 void ui_label(GtkWidget *widget, const char *text)
 {
@@ -61,6 +134,9 @@ void ui_controls(View *v)
     gtk_widget_set_sensitive(v->reveal, v->detail.path.raw != NULL);
     gtk_widget_set_sensitive(v->rescan, v->detail.path.raw && v->selected_kind == DS_DIRECTORY &&
                                         !running && !v->busy);
+#ifdef G_OS_WIN32
+    gtk_widget_set_sensitive(v->retry_admin, can_retry_admin(v));
+#endif
 }
 
 static const char *stage_name(const DsSessionEvent *e)
@@ -107,10 +183,12 @@ gboolean ui_tick(gpointer data)
                 ui_volume_load(v);
             ui_refresh(v);
             ui_details(v, 1, 1, NULL);
-        } else if (v->base && v->mode != TREE) {
-            ds_paged_model_refresh(v->base);
+        } else {
+            ui_live_refresh(v);
         }
     }
+    if (!e.exited && v->db.raw)
+        ui_live_tick(v);
     v->finished = e.exited;
     ui_controls(v);
     return G_SOURCE_CONTINUE;
@@ -198,6 +276,10 @@ static void action(GtkButton *button, gpointer data)
         clipboard(v);
     } else if (strcmp(name, "reveal") == 0) {
         reveal(v);
+#ifdef G_OS_WIN32
+    } else if (strcmp(name, "retry-admin") == 0) {
+        retry_admin(v);
+#endif
     } else if (strcmp(name, "rescan") == 0) {
         Work *w = g_new0(Work, 1);
         w->op = START;
@@ -320,6 +402,7 @@ static GtkWidget *scroll(GtkWidget *child)
 static void dispose_view(gpointer ptr)
 {
     View *v = ptr;
+    ui_live_clear(v);
     if (v->debounce) g_source_remove(v->debounce);
     if (v->ticker) g_source_remove(v->ticker);
     g_clear_object(&v->detail_task);
@@ -482,6 +565,9 @@ static GtkWidget *details(View *v)
     v->copy = button(v, box, UI("원본 경로 복사"), "copy", 0);
     v->reveal = button(v, box, UI("상위 폴더 열기"), "reveal", 0);
     v->rescan = button(v, box, UI("이 폴더 스캔"), "rescan", 0);
+#ifdef G_OS_WIN32
+    v->retry_admin = button(v, box, UI("관리자 재확인 명령 복사"), "retry-admin", 0);
+#endif
     GtkWidget *scope = gtk_label_new(UI("읽기 전용 · 일반 파일 기본 스트림\n링크와 선택 범위 밖은 제외"));
     gtk_label_set_wrap(GTK_LABEL(scope), TRUE);
     gtk_label_set_xalign(GTK_LABEL(scope), 0);

@@ -11,7 +11,7 @@ typedef struct {
 } DsDetails;
 
 DsStatus ds_details_load(DsStore *, int64_t id, int64_t folder, DsMetric metric,
-                         GCancellable *, DsDetails *, DsError *);
+                         bool preview, GCancellable *, DsDetails *, DsError *);
 void ds_details_clear(DsDetails *);
 DsStatus ds_statistics_report(DsStore *, DsMetric, bool group_age, GCancellable *,
                               char **out, DsError *);

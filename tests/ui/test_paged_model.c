@@ -71,6 +71,16 @@ static GObject *wait_row(GListModel *model, guint position)
     g_error("Row at position %u never loaded", position);
 }
 
+static void wait_idle(GListModel *model)
+{
+    gint64 deadline = g_get_monotonic_time() + 8 * G_TIME_SPAN_SECOND;
+    while (ds_paged_model_busy(model) && g_get_monotonic_time() < deadline) {
+        drain();
+        g_usleep(1000);
+    }
+    g_assert_false(ds_paged_model_busy(model));
+}
+
 typedef struct { GThread *owner; bool prefetched; } Changes;
 
 static void observe_changes(GListModel *model, guint position, guint removed, guint added, gpointer data)
@@ -149,6 +159,123 @@ static void cap_limits_rows(void)
     g_assert_cmpint(ds_ui_row_get(more)->entry.id, ==, fixture_count - 100);
 }
 
+typedef struct { guint retained, append_events; } AppendChanges;
+
+static void observe_appends(GListModel *model, guint position, guint removed, guint added, gpointer data)
+{
+    AppendChanges *changes = data;
+    g_assert_cmpuint(position, ==, changes->retained);
+    g_assert_cmpuint(added, ==, 1);
+    g_assert_cmpuint(g_list_model_get_n_items(model), ==, changes->retained + 1);
+    if (!removed) ++changes->append_events;
+    else g_assert_cmpuint(removed, ==, 1);
+}
+
+static void append_test_entry(DsStore *writer, DsEncoding encoding, int64_t id)
+{
+    DsEntry entry = {.id = id, .parent_id = id == 1 ? 0 : 1,
+                     .kind = id <= 2 ? DS_DIRECTORY : DS_FILE};
+    if (id == 1) {
+        g_assert_cmpint(ds_path_new(encoding, NULL, 0, &entry.name, NULL), ==, DS_OK);
+    } else {
+        g_autofree char *name = g_strdup_printf("entry-%" G_GINT64_FORMAT, id);
+        g_assert_cmpint(ds_path_from_arg(name, &entry.name, NULL), ==, DS_OK);
+    }
+    DsError error = {0};
+    DsEntryBatch batch = {&entry, 1};
+    DsStatus status = ds_store_append(writer, &batch, &error);
+    if (status != DS_OK) g_test_message("Append error: %s", error.message);
+    g_assert_cmpint(status, ==, DS_OK);
+    ds_path_clear(&entry.name);
+}
+
+static void appends_preserve_loaded_rows(void)
+{
+    g_autofree char *directory = g_dir_make_tmp("diskscope-paged-append-XXXXXX", NULL);
+    g_assert_nonnull(directory);
+    g_autofree char *database = g_build_filename(directory, "test.db", NULL);
+    DsNativePath path = {0};
+    g_assert_cmpint(ds_path_from_arg(database, &path, NULL), ==, DS_OK);
+    DsScanOptions options;
+    ds_scan_options_init(&options, DS_CONSERVATIVE);
+    g_assert_cmpint(ds_path_from_arg(directory, &options.root, NULL), ==, DS_OK);
+    DsStore *writer;
+    g_assert_cmpint(ds_store_open(&path, DS_STORE_WRITER, &writer, NULL), ==, DS_OK);
+    g_assert_cmpint(ds_store_set_options(writer, &options, NULL), ==, DS_OK);
+    append_test_entry(writer, options.root.encoding, 1);
+    append_test_entry(writer, options.root.encoding, 2);
+
+    DsQuery query = {.parent_id = 1, .sort = DS_SORT_ID};
+    g_autoptr(GListModel) model = ds_paged_model_new(&path, &query);
+    wait_count(model, 1);
+    g_autoptr(GObject) first = wait_row(model, 0);
+    g_assert_cmpint(ds_ui_row_get(first)->entry.id, ==, 2);
+    AppendChanges changes = {.retained = 1};
+    g_signal_connect(model, "items-changed", G_CALLBACK(observe_appends), &changes);
+
+    for (guint i = 0; i < 4; ++i) {
+        append_test_entry(writer, options.root.encoding, i + 3);
+        ds_paged_model_update_appended(model);
+        ds_paged_model_update_appended(model);
+        g_assert_true(ds_paged_model_busy(model));
+        g_assert_cmpuint(g_list_model_get_n_items(model), ==, changes.retained);
+        wait_count(model, changes.retained + 1);
+        g_assert_cmpuint(changes.append_events, ==, i + 1);
+        g_autoptr(GObject) appended = wait_row(model, changes.retained);
+        g_assert_cmpint(ds_ui_row_get(appended)->entry.id, ==, i + 3);
+        g_autoptr(GObject) retained = g_list_model_get_item(model, 0);
+        g_assert_true(retained == first);
+        ++changes.retained;
+    }
+    /* A recount can succeed even if the page requested after it fails.
+     * Move the store out of the way after announcing another new row. */
+    append_test_entry(writer, options.root.encoding, 7);
+    ds_store_close(writer);
+    ds_paged_model_update_appended(model);
+    wait_count(model, changes.retained + 1);
+    wait_idle(model);
+    g_autofree char *moved = g_build_filename(directory, "moved.db", NULL);
+    g_assert_cmpint(g_rename(database, moved), ==, 0);
+    g_autoptr(GObject) placeholder = g_list_model_get_item(model, changes.retained);
+    g_assert_nonnull(placeholder);
+    g_assert_null(ds_ui_row_get(placeholder));
+    wait_idle(model);
+    g_autofree char *error = NULL;
+    g_object_get(model, "query-error", &error, NULL);
+    g_assert_nonnull(error);
+    ds_paged_model_update_appended(model);
+    wait_idle(model);
+    g_assert_cmpint(g_rename(moved, database), ==, 0);
+    ds_paged_model_update_appended(model);
+    wait_idle(model);
+    g_clear_pointer(&error, g_free);
+    g_object_get(model, "query-error", &error, NULL);
+    g_assert_null(error);
+    g_autoptr(GObject) recovered = g_list_model_get_item(model, changes.retained);
+    g_assert_nonnull(ds_ui_row_get(recovered));
+    g_assert_cmpint(ds_ui_row_get(recovered)->entry.id, ==, 7);
+    g_autoptr(GObject) retained = g_list_model_get_item(model, 0);
+    g_assert_true(retained == first);
+
+    DsQuery root = {.parent_id = 0, .sort = DS_SORT_ID};
+    g_signal_handlers_disconnect_by_data(model, &changes);
+    ds_paged_model_update_appended(model);
+    ds_paged_model_set_query(model, &root);
+    changes = (AppendChanges){0};
+    g_signal_connect(model, "items-changed", G_CALLBACK(observe_appends), &changes);
+    wait_count(model, 1);
+    g_assert_cmpuint(changes.append_events, ==, 1);
+    g_assert_false(ds_paged_model_busy(model));
+    g_autoptr(GObject) current = wait_row(model, 0);
+    g_assert_cmpint(ds_ui_row_get(current)->entry.id, ==, 1);
+    g_signal_handlers_disconnect_by_data(model, &changes);
+
+    ds_path_clear(&options.root);
+    ds_path_clear(&path);
+    g_clear_object(&model);
+    remove_fixture(database, directory);
+}
+
 static void shares_page_memory_budget(void)
 {
     g_autofree char *directory = g_dir_make_tmp("diskscope-paged-weighted-XXXXXX", NULL);
@@ -206,6 +333,7 @@ int main(int argc, char **argv)
     g_test_add_func("/paged-model/page-prefetch-eviction", pages_arrive_on_main_context);
     g_test_add_func("/paged-model/generation-tree", changes_discard_previous_query);
     g_test_add_func("/paged-model/cap", cap_limits_rows);
+    g_test_add_func("/paged-model/live-append", appends_preserve_loaded_rows);
     g_test_add_func("/paged-model/shared-cache", shares_page_memory_budget);
     int status = g_test_run();
     ds_path_clear(&fixture);

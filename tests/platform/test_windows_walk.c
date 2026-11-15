@@ -244,36 +244,58 @@ static void resume_deep_ancestors(void)
     g_assert_cmpuint(counts.found, ==, counts.expected);
 }
 
-static GThread *enumerating_thread;
-static DsControl *helper_control;
-static gint helper_operations;
-static gint metadata_active;
+typedef struct {
+    GMutex lock;
+    GCond changed;
+    GThread *walker;
+    DsControl *control;
+    unsigned walker_operations, helper_operations, active, peak_active, pauses;
+} MetadataOverlap;
 
-static HANDLE WINAPI measure_on_helper(LPCWSTR path, DWORD access, DWORD share,
-                                        LPSECURITY_ATTRIBUTES attrs, DWORD disposition,
-                                        DWORD flags, HANDLE template)
+static MetadataOverlap *overlap;
+
+static HANDLE WINAPI observe_metadata_open(LPCWSTR path, DWORD access, DWORD share,
+                                           LPSECURITY_ATTRIBUTES attrs, DWORD disposition,
+                                           DWORD flags, HANDLE template)
 {
-    if (g_thread_self() != enumerating_thread) {
-        g_atomic_int_set(&metadata_active, 1);
-        if (g_atomic_int_add(&helper_operations, 1) == 0) ds_control_pause(helper_control, true);
-    }
-    return CreateFileW(path, access, share, attrs, disposition, flags, template);
+    g_mutex_lock(&overlap->lock);
+    ++overlap->active;
+    overlap->peak_active = MAX(overlap->peak_active, overlap->active);
+    bool walker = g_thread_self() == overlap->walker;
+    unsigned *this_thread = walker ? &overlap->walker_operations : &overlap->helper_operations;
+    const unsigned *other_thread = walker ? &overlap->helper_operations : &overlap->walker_operations;
+    ++*this_thread;
+    g_cond_broadcast(&overlap->changed);
+    /* Keep the real metadata operations in flight until their calls overlap.
+     * Bound the wait so a serial walker fails the assertion without hanging. */
+    gint64 deadline = g_get_monotonic_time() + 2 * G_TIME_SPAN_SECOND;
+    while (*this_thread == 1 && !*other_thread &&
+           g_cond_wait_until(&overlap->changed, &overlap->lock, deadline)) {}
+    if (walker) ds_control_pause(overlap->control, true);
+    g_mutex_unlock(&overlap->lock);
+    HANDLE file = CreateFileW(path, access, share, attrs, disposition, flags, template);
+    g_assert_true(file != INVALID_HANDLE_VALUE);
+    return file;
 }
 
-static BOOL WINAPI close_helper_handle(HANDLE file)
+static BOOL WINAPI observe_metadata_close(HANDLE file)
 {
     const BOOL closed = CloseHandle(file);
-    g_atomic_int_set(&metadata_active, 0);
+    g_mutex_lock(&overlap->lock);
+    --overlap->active;
+    g_mutex_unlock(&overlap->lock);
     return closed;
 }
 
-static void acknowledge_helper_pause(bool paused, void *data)
+static void acknowledge_metadata_pause(bool paused, void *data)
 {
     if (!paused) return;
-    unsigned *pauses = data;
-    g_assert_cmpint(g_atomic_int_get(&metadata_active), ==, 0);
-    ++*pauses;
-    ds_control_pause(helper_control, false);
+    MetadataOverlap *metadata = data;
+    g_mutex_lock(&metadata->lock);
+    g_assert_cmpuint(metadata->active, ==, 0);
+    ++metadata->pauses;
+    g_mutex_unlock(&metadata->lock);
+    ds_control_pause(metadata->control, false);
 }
 
 static void standard_profile_metadata_helper(void)
@@ -290,24 +312,25 @@ static void standard_profile_metadata_helper(void)
     options.profile = DS_STANDARD;
     options.jobs = 2;
     DsWinMetadataOps ops = ds_win_metadata_ops;
-    ops.open = measure_on_helper;
-    ops.close = close_helper_handle;
-    enumerating_thread = g_thread_self();
-    g_atomic_int_set(&helper_operations, 0);
-    g_atomic_int_set(&metadata_active, 0);
-    unsigned pauses = 0;
+    ops.open = observe_metadata_open;
+    ops.close = observe_metadata_close;
     DsControl control;
     ds_control_init(&control);
-    control.pause_changed = acknowledge_helper_pause;
-    control.pause_data = &pauses;
-    helper_control = &control;
+    MetadataOverlap metadata = {.walker = g_thread_self(), .control = &control};
+    g_mutex_init(&metadata.lock);
+    g_cond_init(&metadata.changed);
+    control.pause_changed = acknowledge_metadata_pause;
+    control.pause_data = &metadata;
+    overlap = &metadata;
     Observations found = {g_hash_table_new_full(g_bytes_hash, g_bytes_equal,
                                                (GDestroyNotify)g_bytes_unref, g_free), 0};
     DsError error = {0};
     DsStatus status = ds_win_walk_with_metadata_ops(&options, &control, collect, &found, &error, &ops);
     g_test_message("Standard walk status %d: %s", status, error.message);
     ds_control_clear(&control);
-    helper_control = NULL;
+    overlap = NULL;
+    g_cond_clear(&metadata.changed);
+    g_mutex_clear(&metadata.lock);
     ds_path_clear(&options.root);
     g_assert_true(DeleteFileW(first));
     g_assert_true(DeleteFileW(second));
@@ -318,8 +341,10 @@ static void standard_profile_metadata_helper(void)
 
     g_assert_cmpint(status, ==, DS_OK);
     g_assert_cmpuint(g_hash_table_size(found.entries), ==, 3);
-    g_assert_cmpint(g_atomic_int_get(&helper_operations), ==, 2);
-    g_assert_cmpuint(pauses, ==, 1);
+    g_assert_cmpuint(metadata.peak_active, ==, 2);
+    g_assert_cmpuint(metadata.helper_operations, ==, 1);
+    g_assert_cmpuint(metadata.walker_operations, ==, 1);
+    g_assert_cmpuint(metadata.pauses, ==, 1);
     g_assert_cmpint(observed(&found, L"alpha.bin")->allocated.quality, ==, DS_KNOWN);
     g_assert_cmpint(observed(&found, L"zeta.bin")->allocated.quality, ==, DS_KNOWN);
     g_hash_table_unref(found.entries);

@@ -47,7 +47,7 @@ static gint by_weight(gconstpointer a, gconstpointer b, gpointer data)
     return (left->id > right->id) - (left->id < right->id);
 }
 
-static DsStatus load_children(DsStore *db, int64_t folder, DsMetric metric, GCancellable *cancel,
+static DsStatus load_children(DsStore *db, int64_t folder, DsMetric metric, bool preview, GCancellable *cancel,
                               DsDetails *details, DsError *error)
 {
     DsQuery query = {.parent_id=folder, .after_id=0, .limit=DS_PAGE_MAX, .omit_total=true,
@@ -89,7 +89,7 @@ static DsStatus load_children(DsStore *db, int64_t folder, DsMetric metric, GCan
                 overflow |= !ds_u64_add(other_bytes, size.bytes, &other_bytes);
             }
         }
-        bool done = page->count == 0;
+        bool done = preview || page->count == 0;
         ds_page_free(page);
         if (done)
             break;
@@ -111,11 +111,11 @@ static DsStatus load_children(DsStore *db, int64_t folder, DsMetric metric, GCan
 }
 
 DsStatus ds_details_load(DsStore *db, int64_t id, int64_t folder, DsMetric metric,
-                         GCancellable *cancel, DsDetails *details, DsError *error)
+                         bool preview, GCancellable *cancel, DsDetails *details, DsError *error)
 {
     DsStatus status = id > 0 ? full_path(db, id, &details->path, error) : DS_OK;
     if (status == DS_OK && folder > 0)
-        status = load_children(db, folder, metric, cancel, details, error);
+        status = load_children(db, folder, metric, preview, cancel, details, error);
     return status;
 }
 

@@ -40,8 +40,8 @@ DsReason ds_win_error_reason(DWORD code, DsReason otherwise)
     }
 }
 
-DWORD ds_win_open_node(const DsWinMetadataOps *ops, const WCHAR *path, bool directory,
-                       HANDLE *handle, DsWinNode *node)
+static DWORD open_node(const DsWinMetadataOps *ops, const WCHAR *path, bool directory,
+                       bool need_legacy, HANDLE *handle, DsWinNode *node)
 {
     *node = (DsWinNode){0};
     DWORD flags = FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL;
@@ -64,8 +64,15 @@ DWORD ds_win_open_node(const DsWinMetadataOps *ops, const WCHAR *path, bool dire
 
     node->id_known = ops->query(*handle, FileIdInfo, &node->id, sizeof(node->id));
     if (!node->id_known) node->id_error = GetLastError();
-    node->legacy_known = GetFileInformationByHandle(*handle, &node->legacy);
+    if (need_legacy || !node->id_known)
+        node->legacy_known = GetFileInformationByHandle(*handle, &node->legacy);
     return ERROR_SUCCESS;
+}
+
+DWORD ds_win_open_node(const DsWinMetadataOps *ops, const WCHAR *path, bool directory,
+                       HANDLE *handle, DsWinNode *node)
+{
+    return open_node(ops, path, directory, true, handle, node);
 }
 
 bool ds_win_same_volume(const DsWinNode *a, const DsWinNode *b)
@@ -167,7 +174,7 @@ void ds_win_measure_file(const DsWinMetadataOps *ops, const WCHAR *path,
 {
     DsWinNode node;
     HANDLE handle;
-    const DWORD error = ds_win_open_node(ops, path, false, &handle, &node);
+    const DWORD error = open_node(ops, path, false, root && !root->id_known, &handle, &node);
     if (error) {
         issue(entry, error, DS_REASON_METADATA);
         return;

@@ -31,7 +31,8 @@ add_library(ds_platform STATIC ${ds_platform_dir}/walk.c ${ds_platform_dir}/meta
 target_link_libraries(ds_platform PUBLIC ds_core)
 ds_c_target(ds_platform)
 
-add_executable(diskscope-worker src/worker/main.c ${ds_manifest})
+# The worker talks over inherited pipes and does not need a Windows console.
+add_executable(diskscope-worker WIN32 src/worker/main.c ${ds_manifest})
 target_link_libraries(diskscope-worker PRIVATE ds_protocol ds_platform ds_store ds_local)
 ds_c_target(diskscope-worker)
 

@@ -218,7 +218,7 @@ static DsStatus run(Work *w, GCancellable *cancel, DsControl *control)
         break;
     }
     case DETAILS:
-        status = ds_details_load(reader, w->id, w->folder, w->metric, cancel, &w->detail, error);
+        status = ds_details_load(reader, w->id, w->folder, w->metric, w->preview, cancel, &w->detail, error);
         break;
     case STATS:
         status = ds_statistics_report(reader, w->metric, w->group_age, cancel, &w->report, error);
@@ -260,9 +260,10 @@ static void apply_details(View *v, Work *w)
     g_clear_pointer(&v->detail.map, g_array_unref);
     v->detail.map = g_array_ref(w->detail.map);
     v->mapped_folder = w->folder;
-    char *legend = g_strdup_printf(UI("트리맵 · 0 B %" G_GUINT64_FORMAT
+    const char *label = w->preview ? UI("트리맵 미리보기 (최대 512개)") : UI("트리맵");
+    char *legend = g_strdup_printf(UI("%s · 0 B %" G_GUINT64_FORMAT
         "개 · 미확인 %" G_GUINT64_FORMAT "개 · 기타 %" G_GUINT64_FORMAT "개"),
-        w->detail.zero, w->detail.unknown, w->detail.other);
+        label, w->detail.zero, w->detail.unknown, w->detail.other);
     ui_label(v->legend, legend);
     g_free(legend);
     gtk_widget_queue_draw(v->map);
@@ -275,6 +276,8 @@ static void done(GObject *source, GAsyncResult *result, gpointer data)
     Work *w = g_task_get_task_data(G_TASK(result));
     bool volume = w->op == VOLUME;
     bool background = volume || w->op == DETAILS || w->op == STATS;
+    if (background && !volume && g_task_get_cancellable(G_TASK(result)) == v->detail_task)
+        g_clear_object(&v->detail_task);
     if (v->closing || (!volume && background && w->generation != v->generation) ||
         (volume && (!v->db.raw || !g_bytes_equal(v->db.raw, w->db.raw))))
         return;

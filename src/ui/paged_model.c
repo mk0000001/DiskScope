@@ -33,6 +33,7 @@ typedef struct { guint offset; bool prefetch; } PageRequest;
 
 typedef struct {
     PageRequest request;
+    bool count_only;
     guint64 generation;
     GWeakRef model;
     DsNativePath db;
@@ -59,7 +60,7 @@ typedef struct {
     DsQuery query;
     guint64 generation, total;
     guint length, cap;
-    bool applying;
+    bool applying, append_pending;
     PageLoad *active;
     PageRequest requests[QUEUED_PAGES];
     size_t request_count;
@@ -124,23 +125,35 @@ static void add_page(DsPagedModel *model, guint offset, DsPage *result)
     if (bytes > ROW_CACHE_BUDGET) return;
 
     RowCache *cache = model->cache;
-    RowPage *slot = &model->pages[0];
-    for (size_t i = 1; i < CACHED_PAGES; ++i)
-        if (model->pages[i].last_access < slot->last_access) slot = &model->pages[i];
-    clear_page(cache, slot);
+    RowPage *slot = offset % DS_PAGE_MAX ? find_page(model, offset - 1) : NULL;
+    if (slot && slot->offset + slot->count == offset &&
+        slot->bytes - sizeof(RowPage) <= ROW_CACHE_BUDGET - bytes) {
+        /* Extend a partial cached page without replacing its row objects. */
+        bytes -= sizeof(RowPage);
+        g_queue_unlink(&cache->lru, &slot->lru_link);
+    } else {
+        slot = &model->pages[0];
+        for (size_t i = 1; i < CACHED_PAGES; ++i)
+            if (model->pages[i].last_access < slot->last_access) slot = &model->pages[i];
+        clear_page(cache, slot);
+        slot->offset = offset;
+    }
     while (cache->bytes > ROW_CACHE_BUDGET - bytes)
         clear_page(cache, g_queue_peek_head(&cache->lru));
-    *slot = (RowPage){.offset = offset, .count = (guint)result->count,
-                      .last_access = g_get_monotonic_time(), .items = g_new(DsUiRow *, result->count),
-                      .bytes = bytes, .lru_link.data = slot};
+    guint previous = slot->count;
+    slot->count += (guint)result->count;
+    slot->last_access = g_get_monotonic_time();
+    slot->items = g_renew(DsUiRow *, slot->items, slot->count);
+    slot->bytes += bytes;
+    slot->lru_link.data = slot;
     cache->bytes += bytes;
     g_queue_push_tail_link(&cache->lru, &slot->lru_link);
-    for (guint i = 0; i < slot->count; ++i) {
+    for (guint i = 0; i < result->count; ++i) {
         DsUiRow *item = g_object_new(ds_ui_row_get_type(), NULL);
         item->loaded = true;
         item->row = result->rows[i];
         result->rows[i] = (DsRow){0};
-        slot->items[i] = item;
+        slot->items[previous + i] = item;
     }
 }
 
@@ -188,7 +201,8 @@ static void queue_page(DsPagedModel *model, guint offset, bool prefetch)
 {
     if (find_page(model, offset) || (model->error && offset == model->failed_offset)) return;
     PageLoad *active = model->active;
-    if (active && active->generation == model->generation && active->request.offset == offset) {
+    if (active && !active->count_only && active->generation == model->generation &&
+        active->request.offset == offset) {
         if (!prefetch) active->request.prefetch = false;
         return;
     }
@@ -227,7 +241,19 @@ static void query_done(GObject *source, GAsyncResult *result, gpointer data)
     model->applying = true;
     if (load->generation == model->generation) {
         guint offset = load->request.offset;
-        if (page) {
+        if (page && load->count_only) {
+            guint old_length = model->length;
+            model->total = MAX(model->total, page->total);
+            model->length = list_length(model);
+            if (model->length > old_length)
+                g_list_model_items_changed(G_LIST_MODEL(model), old_length, 0, model->length - old_length);
+            if (load->generation == model->generation && model->error) {
+                guint retry_offset = model->failed_offset;
+                g_clear_pointer(&model->error, g_free);
+                if (retry_offset < model->length) queue_page(model, retry_offset, false);
+                g_object_notify(G_OBJECT(model), "query-error");
+            }
+        } else if (page) {
             guint old_length = model->length;
             if (!load->query.omit_total) model->total = page->total;
             model->length = list_length(model);
@@ -245,10 +271,12 @@ static void query_done(GObject *source, GAsyncResult *result, gpointer data)
             if (load->generation == model->generation && !load->request.prefetch && page->count &&
                 following < model->length)
                 queue_page(model, (guint)following, true);
-        } else if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+        } else if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED) &&
+                   (!load->count_only || !model->error || model->failed_offset == G_MAXUINT)) {
+            /* Keep a failed page available for retry after a later recount. */
             g_free(model->error);
             model->error = g_strdup(error->message);
-            model->failed_offset = offset;
+            model->failed_offset = load->count_only ? G_MAXUINT : offset;
             g_object_notify(G_OBJECT(model), "query-error");
         }
     }
@@ -260,21 +288,31 @@ static void query_done(GObject *source, GAsyncResult *result, gpointer data)
 
 static void start_next(DsPagedModel *model)
 {
-    if (model->active || model->applying || !model->request_count) return;
-    PageRequest request = model->requests[0];
-    --model->request_count;
-    if (model->request_count) model->requests[0] = model->requests[1];
+    if (model->active || model->applying || (!model->request_count && !model->append_pending)) return;
+    bool count_only = model->append_pending && (!model->request_count || model->requests[0].prefetch);
+    PageRequest request = {0};
+    if (count_only) {
+        model->append_pending = false;
+    } else {
+        request = model->requests[0];
+        --model->request_count;
+        if (model->request_count) model->requests[0] = model->requests[1];
+    }
 
     PageLoad *load = g_new0(PageLoad, 1);
     load->request = request;
+    load->count_only = count_only;
     load->generation = model->generation;
     g_weak_ref_init(&load->model, model);
     load->db = (DsNativePath){model->db.encoding, g_bytes_ref(model->db.raw)};
     load->query = copy_query(&model->query);
     load->query.offset = request.offset;
-    load->query.after_id = 0;
-    load->query.limit = MIN(DS_PAGE_MAX, G_MAXUINT - request.offset);
-    load->query.omit_total = request.offset != 0;
+    /* The count ignores the cursor. At the highest possible ID there are
+     * no matching rows to materialize alongside it. */
+    load->query.after_id = count_only ? INT64_MAX : 0;
+    load->query.limit = count_only ? 1 : MIN(DS_PAGE_MAX - request.offset % DS_PAGE_MAX,
+                                             G_MAXUINT - request.offset);
+    load->query.omit_total = !count_only && request.offset != 0;
     ds_control_init(&load->control);
     model->active = load;
 
@@ -325,6 +363,7 @@ void ds_paged_model_refresh(GListModel *list)
     model->total = 0;
     model->length = 0;
     model->request_count = 0;
+    model->append_pending = false;
     for (size_t i = 0; i < CACHED_PAGES; ++i) clear_page(model->cache, &model->pages[i]);
     if (model->error) {
         g_clear_pointer(&model->error, g_free);
@@ -332,6 +371,23 @@ void ds_paged_model_refresh(GListModel *list)
     }
     if (count) g_list_model_items_changed(list, 0, count, 0);
     queue_page(model, 0, false);
+}
+
+void ds_paged_model_update_appended(GListModel *list)
+{
+    DsPagedModel *model = (DsPagedModel *)list;
+    const DsQuery *query = &model->query;
+    g_return_if_fail(query->sort == DS_SORT_ID && !query->descending && !query->kind &&
+        (!query->filter || !*query->filter) && !query->extension && !query->issues_only &&
+        !query->has_min_bytes && !query->has_max_bytes && !query->has_mtime_from && !query->has_mtime_to);
+    model->append_pending = true;
+    start_next(model);
+}
+
+bool ds_paged_model_busy(GListModel *list)
+{
+    DsPagedModel *model = (DsPagedModel *)list;
+    return model->active || model->applying || model->request_count || model->append_pending;
 }
 
 void ds_paged_model_set_query(GListModel *list, const DsQuery *query)

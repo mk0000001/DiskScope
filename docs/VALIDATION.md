@@ -1,5 +1,22 @@
 # Validation and performance
 
+## 0.1.3 preview
+
+- On Windows 11 with Windows Terminal, a GUI scan of the same 2,321-entry disposable NTFS fixture was run with the previous worker and with the Windows-subsystem worker. The previous worker triggered a visible terminal host and pseudoconsole. The Windows-subsystem worker finished with no console-window events, and the live process had no console when checked. The native integration test also verifies each executable's PE subsystem and performs a real CLI scan through the worker pipes.
+- A live-model regression test appends committed WAL batches while the writer stays open, then checks the insertion range, cached row identity, loading of appended rows, and query replacement. In WSL 1, the GTK live-view fixture also reproduced SQLite WAL read delays while the separate writer process was active. A system SQLite reader exhibited the same delay. Visibility between commits depends on the cache filesystem's SQLite locking behavior.
+- Windows administrator retry targets the selected access-denied file or folder through a command copied to the clipboard. Execute it only from PowerShell that you opened as administrator.
+
+### Windows scan throughput
+
+Native Windows 11 x64 on a local NTFS volume, using 30,121 observations from 30,000 small files and 120 directories plus the root. The CLI scanned the same fixture three times per build and profile, alternating build order and using new cache and output files. The collection column is measured from process launch to the CLI's first aggregation notification, so it includes startup and about 50 ms of polling granularity. Total time includes final aggregation and writing the standalone snapshot.
+
+| Profile | 0.1.2 collection | 0.1.3 collection | 0.1.2 total | 0.1.3 total |
+|---|---:|---:|---:|---:|
+| Conservative | 3.925 s | 4.328 s | 4.379 s | 4.910 s |
+| Standard | 4.527 s | 3.954 s | 4.948 s | 4.544 s |
+
+Times are medians. Standard reached 1.14× collection throughput and 1.09× end-to-end throughput on this fixture. Conservative was slower in these samples. The 2× target remains unmet. No scan of the system drive was used for this comparison.
+
 ## 0.1.2 preview
 
 | Evidence | Result |

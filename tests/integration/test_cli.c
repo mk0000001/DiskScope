@@ -1,8 +1,37 @@
 #include "diskscope/ds_snapshot.h"
 #include <gio/gio.h>
 #include <glib/gstdio.h>
+#ifdef G_OS_WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 static char *program;
+
+#ifdef G_OS_WIN32
+static void require_subsystem(const char *path, WORD expected)
+{
+    FILE *file = g_fopen(path, "rb");
+    g_assert_nonnull(file);
+    IMAGE_DOS_HEADER dos;
+    IMAGE_NT_HEADERS pe;
+    g_assert_cmpuint(fread(&dos, sizeof dos, 1, file), ==, 1);
+    g_assert_cmpuint(dos.e_magic, ==, IMAGE_DOS_SIGNATURE);
+    g_assert_cmpint(fseek(file, dos.e_lfanew, SEEK_SET), ==, 0);
+    g_assert_cmpuint(fread(&pe, sizeof pe, 1, file), ==, 1);
+    fclose(file);
+    g_assert_cmpuint(pe.Signature, ==, IMAGE_NT_SIGNATURE);
+    g_assert_cmpuint(pe.OptionalHeader.Subsystem, ==, expected);
+}
+
+static void console_subsystems(void)
+{
+    g_autofree char *folder = g_path_get_dirname(program);
+    g_autofree char *worker = g_build_filename(folder, "diskscope-worker.exe", NULL);
+    require_subsystem(worker, IMAGE_SUBSYSTEM_WINDOWS_GUI);
+    require_subsystem(program, IMAGE_SUBSYSTEM_WINDOWS_CUI);
+}
+#endif
 
 static int run(const char *const args[])
 {
@@ -99,6 +128,9 @@ int main(int argc, char **argv)
     argc = 1;
     argv[1] = NULL;
     g_test_init(&argc, &argv, NULL);
+#ifdef G_OS_WIN32
+    g_test_add_func("/windows_console_subsystems", console_subsystems);
+#endif
     g_test_add_func("/usage_codes", usage);
     g_test_add_func("/real_worker_scan", scan);
     return g_test_run();

@@ -30,6 +30,9 @@ typedef struct {
     GtkWidget *save, *export, *compare, *open, *copy, *reveal, *rescan, *hide, *stack, *aggregate, *recover;
     GtkWidget *search, *extension, *minimum, *maximum, *from, *to, *exclude;
     GtkWidget *volume_label;
+#ifdef G_OS_WIN32
+    GtkWidget *retry_admin;
+#endif
     GtkWidget *diagnostics, *diagnostics_root;
     GtkPopover *diagnostics_options;
     GtkTextBuffer *statistics;
@@ -38,16 +41,22 @@ typedef struct {
     DsCacheLease *import_lease;
     DsNativePath db, cache;
     DsDetails detail;
+    GQueue live_models;
     DsTreemapLayout *layout;
     GCancellable *detail_task, *volume_task, *operation;
     guint ticker, debounce;
     int64_t sequence, refreshed, started, selected, mapped_folder;
     int64_t export_selection;
+    int64_t focused_folder;
     guint generation;
+    guint live_pending;
     DsKind selected_kind;
+    DsReason selected_reason;
+    int64_t selected_os_code;
     ViewMode mode;
     WorkType operation_type;
     bool busy, finished, closing, applying_settings, cache_location_changed, recovered_aggregated;
+    bool live_tree, expand_root, preview_pending, list_pending;
 } View;
 
 typedef struct {
@@ -68,12 +77,16 @@ typedef struct {
     guint generation;
     bool include_hidden, group_age, automatic, export_filtered;
     bool include_root, has_worker_event, existing_latest;
+    bool preview;
     char *exclude, *report;
 } Work;
 
 #define UI(text) g_dpgettext2(NULL, "DiskScope", text)
 
 void ui_refresh(View *);
+void ui_live_clear(View *);
+void ui_live_refresh(View *);
+void ui_live_tick(View *);
 void ui_details(View *, int64_t, int64_t, const DsRow *);
 void ui_columns(View *);
 void ui_map(View *);

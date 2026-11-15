@@ -10,7 +10,7 @@ cmake --preset release -DDS_GUI=ON "-DCMAKE_C_FLAGS=-ffile-prefix-map=`"$Project
 cmake --build --preset release
 cmake --install build/release --prefix build/windows-install
 python packaging/windows/package.py --install build/windows-install --msys2 $Msys2Root `
-    --output build/windows-dist --source-cache build/windows-source-cache --version 0.1.2
+    --output build/windows-dist --source-cache build/windows-source-cache --version 0.1.3
 ```
 
 For a smaller CLI archive, configure with `-DDS_GUI=OFF`, install to a fresh prefix, and pass `--cli-only` to the packaging script. Omit build-directory artifacts when copying the distribution. The executable folder must stay alongside the `lib` and `share` folders from the ZIP.

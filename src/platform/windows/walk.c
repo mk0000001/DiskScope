@@ -135,6 +135,14 @@ static DsStatus collect_metadata(Walker *w)
     return status;
 }
 
+static DsStatus finish_metadata(Walker *w)
+{
+    if (!w->pending) return DS_OK;
+    DsStatus status = collect_metadata(w);
+    if (status == DS_OK && !ds_control_checkpoint(w->control)) return DS_CANCELED;
+    return status;
+}
+
 static bool boundary_requested(DsControl *control)
 {
     if (!control) return false;
@@ -266,9 +274,16 @@ static DWORD search_directory(Walker *w, Directory *directory, WIN32_FIND_DATAW 
         if (pattern) {
             reserve_search(w);
             directory->find = FindFirstFileExW(pattern, FindExInfoBasic, found,
-                                               FindExSearchNameMatch, NULL, 0);
+                                               FindExSearchNameMatch, NULL, FIND_FIRST_EX_LARGE_FETCH);
+            if (directory->find == INVALID_HANDLE_VALUE) {
+                error = GetLastError();
+                if (error == ERROR_INVALID_PARAMETER || error == ERROR_NOT_SUPPORTED) {
+                    directory->find = FindFirstFileExW(pattern, FindExInfoBasic, found,
+                                                       FindExSearchNameMatch, NULL, 0);
+                    error = directory->find == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+                }
+            }
             if (directory->find != INVALID_HANDLE_VALUE) ++w->open_searches;
-            else error = GetLastError();
             g_free(pattern);
         } else {
             error = ERROR_FILENAME_EXCED_RANGE;
@@ -331,13 +346,19 @@ static bool dot_entry(const WCHAR *name)
 
 static DsStatus observe_child(Walker *w, Directory *directory, const WIN32_FIND_DATAW *found)
 {
-    if (w->last_id == INT64_MAX)
+    if (w->last_id == INT64_MAX) {
+        DsStatus status = finish_metadata(w);
+        if (status != DS_OK) return status;
         return ds_error(w->error, DS_LIMIT, 0, "Windows scan ran out of entry identifiers");
+    }
 
     DsEntry entry = {.id = ++w->last_id, .parent_id = directory->entry.id};
     const size_t bytes = wcslen(found->cFileName) * sizeof(WCHAR);
     DsStatus status = ds_path_new(DS_PATH_UTF16LE, found->cFileName, bytes, &entry.name, w->error);
-    if (status != DS_OK) return status;
+    if (status != DS_OK) {
+        DsStatus pending = finish_metadata(w);
+        return pending == DS_OK ? status : pending;
+    }
     ds_win_find_metadata(found, &entry);
     WCHAR *child = NULL;
     if (entry.reason == DS_REASON_NONE) {
@@ -354,17 +375,21 @@ static DsStatus observe_child(Walker *w, Directory *directory, const WIN32_FIND_
             entry.kind = DS_EXCLUDED;
             entry.reason = DS_REASON_LIMIT;
         } else if (entry.kind == DS_FILE) {
-            if (w->helper) {
+            if (w->pending && boundary_requested(w->control)) status = finish_metadata(w);
+            if (status == DS_OK && w->helper && !w->pending) {
                 w->job = (MetadataJob){.entry = entry, .path = child, .found = *found};
                 w->pending = true;
                 g_async_queue_push(w->requests, &w->job);
                 return DS_OK;
             }
-            ds_win_measure_file(w->file_ops, child, &w->root, found, &entry);
+            /* The walker can measure an adjacent file alongside the helper.
+             * Both calls finish before the next cursor step or pause. */
+            if (status == DS_OK) ds_win_measure_file(w->file_ops, child, &w->root, found, &entry);
         }
     }
 
-    status = emit(w, &entry);
+    if (status == DS_OK) status = finish_metadata(w);
+    if (status == DS_OK) status = emit(w, &entry);
     if (status == DS_OK && entry.kind == DS_DIRECTORY) {
         directory->cursor = g_bytes_ref(entry.name.raw);
         Directory frame = {.entry = entry, .path_length = wcslen(child), .find = INVALID_HANDLE_VALUE};
@@ -392,8 +417,8 @@ static DsStatus enumerate(Walker *w)
     status = emit(w, &root.entry);
 
     while (status == DS_OK && w->directories->len) {
-        /* Let a file query overlap the next cursor advancement. Drain the
-         * helper before acknowledging a pause or delivering the next entry. */
+        /* A helper query can overlap cursor advancement and then the next
+         * file query. Drain it at a requested control boundary. */
         if (w->pending && boundary_requested(w->control)) {
             status = collect_metadata(w);
             if (status != DS_OK) return status;
@@ -417,12 +442,13 @@ static DsStatus enumerate(Walker *w)
             if (directory->cursor) error = check_return_path(w, directory);
             if (!error) error = next_entry(directory->find, &found);
         }
-        if (w->pending) {
-            status = collect_metadata(w);
-            if (status != DS_OK) return status;
-            if (!ds_control_checkpoint(w->control)) return DS_CANCELED;
-        }
         g_clear_pointer(&directory->cursor, g_bytes_unref);
+        if (!error && !dot_entry(found.cFileName)) {
+            status = observe_child(w, directory, &found);
+            continue;
+        }
+        status = finish_metadata(w);
+        if (status != DS_OK) return status;
         if (error == ERROR_NO_MORE_FILES || error == ERROR_FILE_NOT_FOUND) {
             pop_directory(w);
         } else if (error) {
@@ -434,8 +460,6 @@ static DsStatus enumerate(Walker *w)
             directory->entry.os_code = error;
             status = emit(w, &directory->entry);
             pop_directory(w);
-        } else if (!dot_entry(found.cFileName)) {
-            status = observe_child(w, directory, &found);
         }
     }
     return status;

@@ -282,10 +282,9 @@ static bool options_from_start(JsonObject *payload, DsScanOptions *options,
            ds_ipc_json_path(payload, "cache", &options->cache_path, error);
 }
 
-int main(void)
+static int run_worker(void)
 {
 #ifdef G_OS_WIN32
-    SetConsoleCtrlHandler(NULL, TRUE);
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
 #else
@@ -353,3 +352,19 @@ int main(void)
     /* stdout was flushed. A blocked command read must not hold stdio shutdown. */
     _Exit(ok ? 0 : 5);
 }
+
+#ifdef G_OS_WIN32
+int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command, int show)
+{
+    (void)instance;
+    (void)previous;
+    (void)command;
+    (void)show;
+    return run_worker();
+}
+#else
+int main(void)
+{
+    return run_worker();
+}
+#endif

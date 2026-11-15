@@ -11,7 +11,8 @@ static char *format_metric(const DsRow *row, DsMetric metric)
     if (value.quality == DS_OVERFLOW)
         return g_strdup(UI("범위 초과"));
     if (value.quality != DS_KNOWN)
-        return g_strdup(row->entry.kind == DS_DIRECTORY && !row->aggregated ?
+        return g_strdup(!row->aggregated && (row->entry.kind == DS_DIRECTORY ||
+                        (row->entry.kind == DS_FILE && metric == DS_UNIQUE)) ?
                         UI("집계 전") : UI("확인 못함"));
     char *bytes = g_format_size_full(value.bytes, G_FORMAT_SIZE_IEC_UNITS);
     if (!row->unknown[metric])
@@ -119,15 +120,57 @@ void ui_columns(View *v)
     }
 }
 
+static void live_model_gone(gpointer data, GObject *model)
+{
+    View *v = data;
+    g_queue_remove(&v->live_models, model);
+}
+
+void ui_live_clear(View *v)
+{
+    while (!g_queue_is_empty(&v->live_models)) {
+        GObject *model = g_queue_pop_head(&v->live_models);
+        g_object_weak_unref(model, live_model_gone, v);
+    }
+    v->live_pending = 0;
+    v->live_tree = false;
+    v->expand_root = false;
+    v->preview_pending = false;
+    v->list_pending = false;
+}
+
 static GListModel *child_model(gpointer item, gpointer ptr)
 {
     View *v = ptr;
     const DsRow *row = ds_ui_row_get(G_OBJECT(item));
     if (!row || row->entry.kind != DS_DIRECTORY)
         return NULL;
-    DsQuery q = {.parent_id=row->entry.id, .metric=ui_metric(v),
-                 .sort=DS_SORT_METRIC, .descending=true, .limit=DS_PAGE_MAX};
-    return ds_paged_model_new(&v->db, &q);
+    DsQuery q = {.parent_id=row->entry.id, .metric=ui_metric(v), .limit=DS_PAGE_MAX,
+                 .sort=v->live_tree ? DS_SORT_ID : DS_SORT_METRIC, .descending=!v->live_tree};
+    GListModel *model = ds_paged_model_new(&v->db, &q);
+    if (v->live_tree) {
+        g_queue_push_tail(&v->live_models, model);
+        g_object_weak_ref(G_OBJECT(model), live_model_gone, v);
+    }
+    return model;
+}
+
+static void expand_live_root(View *v)
+{
+    if (!v->expand_root)
+        return;
+    if (!g_list_model_get_n_items(v->base)) {
+        if (!ds_paged_model_busy(v->base))
+            ds_paged_model_refresh(v->base);
+        return;
+    }
+    GtkTreeListModel *tree = GTK_TREE_LIST_MODEL(gtk_single_selection_get_model(v->selection));
+    GtkTreeListRow *root = gtk_tree_list_model_get_row(tree, 0);
+    if (root) {
+        v->expand_root = false;
+        gtk_tree_list_row_set_expanded(root, TRUE);
+        g_object_unref(root);
+    }
 }
 
 static bool parse_bytes(GtkWidget *input, uint64_t *out)
@@ -162,6 +205,8 @@ static void selection_changed(GObject *model, GParamSpec *param, gpointer data)
     View *v = data;
     const DsRow *row = model_row(gtk_single_selection_get_selected_item(GTK_SINGLE_SELECTION(model)));
     v->export_selection = row ? row->entry.id : 0;
+    v->selected_reason = row ? row->entry.reason : DS_REASON_NONE;
+    v->selected_os_code = row ? row->entry.os_code : 0;
     if (row) {
         v->selected_kind = row->entry.kind;
         int64_t folder = row->entry.kind == DS_DIRECTORY ? row->entry.id : row->entry.parent_id;
@@ -195,11 +240,14 @@ DsQuery ui_result_query(View *v, bool *tree)
 void ui_refresh(View *v)
 {
     ++v->generation;
+    ui_live_clear(v);
     if (v->detail_task)
         g_cancellable_cancel(v->detail_task);
-    v->selected = v->mapped_folder = 0;
+    v->selected = v->mapped_folder = v->focused_folder = 0;
     v->export_selection = 0;
     v->selected_kind = 0;
+    v->selected_reason = DS_REASON_NONE;
+    v->selected_os_code = 0;
     ds_details_clear(&v->detail);
     ui_label(v->path, "");
     ui_label(v->info, "");
@@ -224,6 +272,13 @@ void ui_refresh(View *v)
     }
     bool tree;
     DsQuery q = ui_result_query(v, &tree);
+    v->live_tree = tree && ui_alive(v);
+    if (v->live_tree) {
+        q.sort = DS_SORT_ID;
+        q.descending = false;
+        v->expand_root = true;
+        v->preview_pending = true;
+    }
     v->base = ds_paged_model_new(&v->db, &q);
     if (v->mode == TOP_DIR || v->mode == TOP_FILE)
         ds_paged_model_set_cap(v->base, gtk_drop_down_get_selected(v->cap) ? 1000 : 100);
@@ -236,19 +291,61 @@ void ui_refresh(View *v)
     gtk_column_view_set_model(v->table, GTK_SELECTION_MODEL(v->selection));
 }
 
+void ui_live_refresh(View *v)
+{
+    if (v->live_tree) {
+        v->live_pending = v->live_models.length;
+        v->preview_pending = true;
+    } else if (v->base) {
+        v->list_pending = true;
+    }
+}
+
+void ui_live_tick(View *v)
+{
+    expand_live_root(v);
+    if (v->list_pending && !ds_paged_model_busy(v->base)) {
+        v->list_pending = false;
+        ds_paged_model_refresh(v->base);
+    }
+    /* A user can expand many folders. Feed their readers in batches on the
+     * existing UI timer and retain live model references only in GTK. */
+    guint count = MIN(4u, MIN(v->live_pending, v->live_models.length));
+    for (guint i = 0; i < count; ++i) {
+        GList *link = g_queue_pop_head_link(&v->live_models);
+        g_queue_push_tail_link(&v->live_models, link);
+        ds_paged_model_update_appended(link->data);
+    }
+    v->live_pending = v->live_models.length ? v->live_pending - count : 0;
+    if (v->preview_pending && !v->detail_task) {
+        v->preview_pending = false;
+        Work *job = g_new0(Work, 1);
+        job->op = DETAILS;
+        job->folder = v->focused_folder ? v->focused_folder : 1;
+        job->metric = ui_metric(v);
+        job->preview = true;
+        ui_copy_path(&job->db, &v->db);
+        ui_launch(v, job);
+    }
+}
+
 void ui_details(View *v, int64_t id, int64_t folder, const DsRow *row)
 {
     if (!v->db.raw || v->mode == EXTENSIONS || v->mode == DATES)
         return;
     v->selected = id;
+    v->focused_folder = folder;
     ds_path_clear(&v->detail.path);
     if (row) {
         char *logical = format_metric(row, DS_LOGICAL);
         char *alloc = format_metric(row, DS_ALLOCATED);
         char *unique = format_metric(row, DS_UNIQUE);
+        uint64_t count = row->entry.kind == DS_FILE ? 1 : row->file_count;
+        g_autofree char *files = row->entry.kind == DS_DIRECTORY && !row->aggregated ?
+            g_strdup(UI("파일 수 집계 전")) : g_strdup_printf(UI("파일 %" G_GUINT64_FORMAT "개"), count);
         char *stats = g_strdup_printf(UI("논리 크기\n%s\n\nOS 보고 할당량\n%s\n\n중복 제외 할당량\n%s"
-            "\n\n파일 %" G_GUINT64_FORMAT "개 · 링크 %" G_GUINT64_FORMAT "개\n%s"),
-            logical, alloc, unique, row->file_count, row->entry.links, reason(row->entry.reason));
+            "\n\n%s · 링크 %" G_GUINT64_FORMAT "개\n%s"),
+            logical, alloc, unique, files, row->entry.links, reason(row->entry.reason));
         ui_label(v->info, stats);
         g_free(stats);
         g_free(unique);
@@ -257,12 +354,17 @@ void ui_details(View *v, int64_t id, int64_t folder, const DsRow *row)
     } else {
         ui_label(v->info, "");
         v->selected_kind = 0;
+        v->selected_reason = DS_REASON_NONE;
+        v->selected_os_code = 0;
     }
     ++v->generation;
     Work *job = g_new0(Work, 1);
     job->op = DETAILS;
     job->id = id;
     job->folder = v->mapped_folder == folder ? 0 : folder;
+    job->preview = ui_alive(v);
+    if (job->preview && job->folder)
+        v->preview_pending = false;
     job->metric = ui_metric(v);
     ui_copy_path(&job->db, &v->db);
     ui_launch(v, job);
