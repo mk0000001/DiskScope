@@ -10,6 +10,17 @@ DiskScope 0.1.0 preview, 2026-11-15. Fixtures were disposable directories and ge
 | Ubuntu 24.04.4 LTS amd64 | WSL 1, GCC 13.3.0, GTK 4.14.5. The Linux scanner ran through its `fstatat` and mountinfo compatibility branch. Real same-device bind-mount, permission denial, symlink, sparse, file-replacement, and 1,000-level fixtures were exercised. The depth test used a descriptor limit of 12. Xvfb exercised GTK with the default renderer and `--cairo`. |
 | Native Linux kernel, desktop Wayland, Windows clean VM | NOT RUN. WSL 1 lacks native `openat2`/`statx` support and transforms invalid UTF-8 filenames before they reach the scanner. The raw-filename case reports SKIP there. The Windows portable test removed MSYS2 from PATH on the build machine. |
 
+## CTest results
+
+| Suite | Outcome |
+|---|---|
+| Windows native UCRT64 Release, GUI enabled | 16/16 groups PASS |
+| Ubuntu 24.04.4 WSL 1 Release, GUI enabled | 17/17 groups PASS |
+| Ubuntu 24.04.4 WSL 1 ASan/UBSan, GUI enabled | 17/17 groups PASS |
+| Ubuntu 24.04.4 WSL 1 non-root smoke | CLI scan, export, compare and Xvfb snapshot import PASS with both renderers |
+
+CTest groups can contain multiple assertions, fixtures and environment-dependent subcases. The Linux raw-filename subcase is SKIP on WSL 1. ASan/UBSan instrument project C code.
+
 ## Acceptance evidence
 
 | IDs | Evidence and remaining coverage |

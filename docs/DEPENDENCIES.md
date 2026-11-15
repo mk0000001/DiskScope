@@ -26,3 +26,20 @@ The version and SHA-256 below come from Ubuntu's APT index. They identify the te
 | ninja-build | 1.11.1-2 | 6a17f76a0f75586f1292f6c61a9b07fd0dec963baf6a102b17673f601c6b323a |
 
 [Ubuntu Noble packages](https://packages.ubuntu.com/noble/)
+
+## Windows 11 x64 build inputs
+
+These are the exact MSYS2 UCRT64 archive versions and SHA-256 hashes consumed for this build. Package names use the prefix mingw-w64-ucrt-x86_64-. The portable ZIP also contains runtime-manifest.json with all 48 runtime package owners, corresponding source archives and checksums.
+
+| Package | Version | SHA-256 |
+|---|---|---|
+| gcc | 16.2.0-7 | c7c5ac5a7413e9a3b5afa367288568058dcecce8fdd690059c5bbfa07def01b9 |
+| cmake | 4.5.0-1 | 146cfea017827e0203c23fe8317442fa052650bbb59f8d40427e37687cd38222 |
+| ninja | 1.13.2-1 | 514685563a84a6ebddbbeee7bbafae5f3994e363c49364fc4507fabcaa049f2b |
+| pkgconf | 1~3.0.10-1 | c234b9f8280f1e931efe8e4350085f544e4a6081ffcbd2caa3e81834e72e4688 |
+| cairo | 1.18.6-2 | 021c0a4d1df463d08d0cac170818a7cbaccaa5b09ac6edc7948e461cb5a46e85 |
+| glib2 | 2.90.1-1 | 9a7826349279bcca0c935b01880d812be9de9609aef2205be68fd7a6128c1695 |
+| gtk4 | 4.24.1-1 | 03e6fd251437d50ea8c53b90e2ece1879064fdc30d0c7675da64f1d0ce3bcde8 |
+| json-glib | 1.10.8-2 | 3b07443be79b7be8062f085d4453161fc71441700494a393807f76c0abda2fc6 |
+
+[MSYS2 UCRT64 package archive](https://repo.msys2.org/mingw/ucrt64/)
