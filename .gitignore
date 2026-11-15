@@ -1,0 +1,11 @@
+/build/
+/.superpowers/
+/CMakeUserPresets.json
+/START_HERE.md
+/CODEX_PROMPT_KO.txt
+*.dscan
+*.dscan-wal
+*.dscan-shm
+*.log
+.env*
+/dist/
