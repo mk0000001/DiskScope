@@ -1,5 +1,39 @@
 # Validation and performance
 
+## 0.1.2 preview
+
+| Evidence | Result |
+|---|---|
+| Native Windows 11 x64, build 26300 | UCRT64 Release CTest 20/20 groups PASS. The retention symlink subcase reports SKIP without symlink privilege. A separate real NTFS junction fixture preserved aged caches through the junction alias and pruned the same eligible caches through the ordinary base. |
+| Extracted Windows portable ZIP | The packaged CLI and both GTK renderers ran with a Windows-system-only PATH, an isolated profile and a separate working directory. The CLI reported 8 fixture observations and 17 logical bytes, with hardlinks and a real junction, a 345-unit UTF-16 source path and a 1,174-unit cache base. Both renderers loaded the bundled GTK libraries and opened private imports beyond 1,240 UTF-16 units. Clean Windows VM NOT RUN because the host had no accessible guest. |
+| Ubuntu 24.04.4 amd64 on WSL 1 | Debug, Release and ASan/UBSan each passed 20/20 CTest groups. The raw-filename subcase reports SKIP under WSL 1. The release DEB was extracted as an ordinary user. Xvfb exercised the default and Cairo renderers and headless Weston exercised Cairo at GDK scale 2. The CLI scanned a disposable root, then the GUI opened a snapshot and recovered cached rows with the original fixture moved. |
+| Fresh Ubuntu 24.04 amd64 package install | GitHub Actions installed the CI-built DEB and its runtime dependencies in the [official Ubuntu container](https://hub.docker.com/_/ubuntu/tags?name=24.04) at the digest recorded in the workflow. The CLI, GTK import and startup recovery smoke passed under an ordinary user. GCC, CMake and Ninja were absent at runtime. [CI run](https://github.com/mk0000001/DiskScope/actions/runs/43716280965) |
+| Cache retention | Fixtures cover age, count, byte budget, newest recoverable cache, live leases, cancellation, foreign and linked directories, unknown files, and atomic replacement of the primary file. The GTK smoke checks that displayed private imports keep a lease until the app exits. |
+| Diagnostic report | Integration tests cover default redaction, root opt-in, environment-only output, cancellation preserving the destination, and source database protection. The real GTK save dialog in the extracted Ubuntu package wrote both the redacted and root-enabled JSON. The only changed JSON fields were `paths_redacted` and `scan.root`. |
+
+### GUI interaction and memory
+
+A 0.1.2 Release build ran on Ubuntu 24.04.4 WSL 1, i7-10700K, GTK 4.14.5 with Cairo at GDK scale 1, and Xvfb at 1440×1000×24 and 96 DPI. The synthetic SQLite result has 1,000,001 rows including the root, 420,585,472 bytes, and SHA-256 `703c6c496edcabcd11fba29f7c41954aebc6795bf895f3d13b9f444321692aca`. The app was timed from launch through the first painted root row, then from XTest clicks or the last search digit through the expected AT-SPI row and its painted pixels. The startup import warmed the cache. There were 20 samples per interaction and the table uses nearest-rank quantiles.
+
+| Input to expected painted result | p50 | p95 | Max |
+|---|---:|---:|---:|
+| Expand root | 285.14 ms | 307.95 ms | 322.71 ms |
+| Switch to Top 100 files | 1,014.46 ms | 1,149.41 ms | 1,152.08 ms |
+| Change the last digit in an exact path search | 10,413.88 ms | 12,582.35 ms | 13,172.52 ms |
+
+Launch through the first painted row took 14.98 s. Search first changed the result region at 224.21 ms p95, including the 200 ms debounce. Each expected-result interaction exceeded the 100 ms p95 target. The GTK process peaked at 144,224 KiB (140.84 MiB) by `wait4`, corroborated by sampled RSS. This was a snapshot-viewer workload without a scan worker. The ≥500-event mixed scan/scroll/search/selection workload, total RSS during active collection and UI cancellation latency were NOT RUN.
+
+To reproduce on Ubuntu, install `xvfb xauth dbus-daemon at-spi2-core python3-pyatspi python3-xlib fonts-noto-cjk` for the test harness. Point the command to the generated fixture file printed by the C benchmark. Use `--diagnostics-only` with a `--small` fixture to exercise report saving.
+
+```sh
+cmake --preset release
+cmake --build --preset release
+cmake --build --preset release --target diskscope-benchmark
+build/release/bin/diskscope-benchmark --build /path/to/empty-directory --samples 32
+dbus-run-session -- xvfb-run -a -s '-screen 0 1440x1000x24 -dpi 96' \
+  /usr/bin/python3 tests/perf/desktop.py build/release/bin/diskscope /path/to/result/benchmark.dscan --samples 20
+```
+
 ## 0.1.1 preview
 
 | Evidence | Result |
@@ -10,7 +44,7 @@
 | Version compatibility and recovery | v1 snapshots opened, backed up and reopened with volume data absent. v2 malformed volume data was rejected. A distinct child process kept an active lease after the controller lease closed. A separate fixture left committed observations in a WAL on process exit and recovered them without reopening the original root. |
 | Export scope | Integration tests cover a selected file, nested folders, filtered matches across pagination, invalid and non-UTF-8 paths, cancellation and preservation of existing outputs. Both OSes ran CLI selected-ID export. |
 
-The clean Windows 11 VM, live cloud provider, desktop fractional scale and keyboard matrix, end-to-end GUI responsiveness, and specialized filesystems remain unmeasured.
+The 0.1.1 run omitted a clean Windows 11 VM, live cloud provider, desktop fractional scale and keyboard matrix, end-to-end GUI responsiveness, and specialized filesystems.
 
 ## 0.1.0 baseline
 
