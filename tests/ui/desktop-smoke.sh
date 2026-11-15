@@ -79,15 +79,23 @@ for renderer in "${renderers[@]}"; do
     "$bin/diskscope-cli" export --input "$copy" --format json --output "$work/verified.json"
     sleep 0.3
     kill -0 "$app"
+    import_dir=$(dirname "$copy")
+    test -s "$import_dir/cache-owner.v1"
+    if flock -n "$import_dir/scan.lock" true; then
+        printf 'Displayed snapshot failed to hold its cache lease\n' >&2
+        exit 1
+    fi
     kill "$app"
     wait "$app" || true
     app=
+    flock -n "$import_dir/scan.lock" true
     printf 'PASS GTK import · %s · %s · GDK_SCALE=%s\n' "$backend" "$renderer" "$scale"
 done
 
 export XDG_CACHE_HOME="$work/cli-cache"
 lease=$(find "$XDG_CACHE_HOME" -type f -name scan.lock -print -quit)
 test -n "$lease"
+test -s "$(dirname "$lease")/cache-owner.v1"
 flock -n "$lease" true
 mv "$work/source" "$work/moved-source"
 GDK_BACKEND="$backend" GTK_A11Y=none G_DEBUG=fatal-criticals \

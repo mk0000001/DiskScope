@@ -1,4 +1,5 @@
 #include "diskscope/ds_session.h"
+#include "cache_lease.h"
 #include <glib/gstdio.h>
 
 static DsSessionEvent reach(DsSession *session, DsStage stage)
@@ -60,9 +61,18 @@ static void exercise(bool crash)
         g_assert_cmpint(finished.result, ==, DS_CANCELED);
     }
     char *db = ds_path_arg(ds_session_db_path(s), NULL);
-    ds_session_unref(s);
     char *cache = g_path_get_dirname(db);
-    char *lock = g_build_filename(cache, "scan.lock", NULL);
+    g_assert_null(ds_cache_lease_open(cache, false, true, NULL));
+    ds_session_unref(s);
+    DsCacheLease *lease = NULL;
+    for (unsigned attempt = 0; !lease && attempt < 200; ++attempt) {
+        lease = ds_cache_lease_open(cache, false, true, NULL);
+        if (!lease)
+            g_usleep(10000);
+    }
+    g_assert_nonnull(lease);
+    ds_cache_lease_close(lease);
+    char *lock = g_build_filename(cache, DS_CACHE_LEASE_FILE, NULL);
     g_unlink(lock);
     g_free(lock);
     g_rmdir(cache);

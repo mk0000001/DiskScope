@@ -2,6 +2,7 @@
 #include "diskscope/ds_store.h"
 #include "local.h"
 #include "cache_lease.h"
+#include "diskscope/ds_retention.h"
 #include "protocol.h"
 
 #include <gio/gio.h>
@@ -266,7 +267,6 @@ static gpointer receive_events(gpointer ptr)
     DsError recovery = {0};
     bool reconciled = reconcile_cache(s, !normal ? DS_IO : late_cancel ? DS_CANCELED : DS_RUN_RUNNING,
                                       &recovery);
-    g_clear_pointer(&s->lease, ds_cache_lease_close);
     g_mutex_lock(&s->lock);
     s->event.exited = true;
     if (!normal) {
@@ -349,6 +349,8 @@ DsSession *ds_session_start(const DsScanOptions *options, DsSessionCallback call
     }
     char *worker = ds_worker_binary(error);
     char *root = worker ? absolute_root(&options->root, error) : NULL;
+    if (root)
+        ds_cache_prune(&options->cache_path, NULL);
     char *cache = root ? ds_private_cache(&options->cache_path, error) : NULL;
     DsCacheLease *lease = cache ? ds_cache_lease_open(cache, true, false, error) : NULL;
     char *database = lease ? g_build_filename(cache, "scan.sqlite", NULL) : NULL;

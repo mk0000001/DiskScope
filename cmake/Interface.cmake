@@ -1,8 +1,10 @@
 target_sources(ds_store PRIVATE src/store/validate.c src/core/compare.c
-    src/export/csv.c src/export/json.c)
+    src/export/csv.c src/export/json.c src/export/diagnostics.c)
 target_sources(diskscope-cli PRIVATE src/cli/results.c)
 
 if(BUILD_TESTING)
+    ds_test(integration.diagnostics tests/integration/test_diagnostics.c)
+    target_link_libraries(test_integration_diagnostics PRIVATE ds_store PkgConfig::JSON)
     foreach(test snapshot export compare resource_failures)
         ds_test(integration.${test} tests/integration/test_${test}.c)
         target_link_libraries(test_integration_${test} PRIVATE ds_store)

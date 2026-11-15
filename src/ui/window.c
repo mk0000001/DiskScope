@@ -53,6 +53,10 @@ void ui_controls(View *v)
     gtk_widget_set_sensitive(v->aggregate, result && (partial_recovery ||
                              (v->session && event.result != DS_OK)));
     gtk_widget_set_sensitive(v->recover, !running && !v->busy);
+    gtk_widget_set_sensitive(v->diagnostics, !v->busy && (!running || v->db.raw));
+    gtk_widget_set_sensitive(v->diagnostics_root, v->db.raw != NULL);
+    gtk_widget_set_tooltip_text(v->cancel, v->operation && v->operation_type == DIAGNOSTICS ?
+        UI("진단 보고서 저장 취소") : NULL);
     gtk_widget_set_sensitive(v->copy, v->detail.path.raw != NULL);
     gtk_widget_set_sensitive(v->reveal, v->detail.path.raw != NULL);
     gtk_widget_set_sensitive(v->rescan, v->detail.path.raw && v->selected_kind == DS_DIRECTORY &&
@@ -176,7 +180,7 @@ static void action(GtkButton *button, gpointer data)
     else if (strcmp(name, "cancel") == 0) {
         if (v->operation)
             g_cancellable_cancel(v->operation);
-        if (ui_alive(v)) {
+        if ((!v->operation || v->operation_type != DIAGNOSTICS) && ui_alive(v)) {
             ds_session_request_cancel(v->session);
             ui_tick(v);
         }
@@ -206,6 +210,22 @@ static void action(GtkButton *button, gpointer data)
         ui_file_dialog(v, (WorkType)GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "operation")));
     }
     ui_controls(v);
+}
+
+static void diagnostics_save(GtkButton *button, gpointer data)
+{
+    (void)button;
+    View *v = data;
+    bool include_root = v->db.raw && gtk_check_button_get_active(GTK_CHECK_BUTTON(v->diagnostics_root));
+    gtk_popover_popdown(v->diagnostics_options);
+    ui_diagnostics_dialog(v, include_root);
+}
+
+static void diagnostics_reset(GtkPopover *popover, gpointer data)
+{
+    (void)popover;
+    View *v = data;
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(v->diagnostics_root), FALSE);
 }
 
 static GtkWidget *button(View *v, GtkWidget *box, const char *text, const char *name, WorkType op)
@@ -309,6 +329,7 @@ static void dispose_view(gpointer ptr)
     g_clear_object(&v->base);
     ds_session_unref(v->session);
     ds_recovered_free(v->recovered);
+    ds_cache_lease_close(v->import_lease);
     ds_path_clear(&v->cache);
     ds_path_clear(&v->db);
     ds_details_clear(&v->detail);
@@ -395,6 +416,24 @@ static GtkWidget *sidebar(View *v)
     v->recover = button(v, box, UI("최근 캐시 열기"), "recover", 0);
     button(v, box, UI("결과 새로고침"), "refresh", 0);
     v->aggregate = button(v, box, UI("부분 결과 집계"), "aggregate", 0);
+    v->diagnostics = gtk_menu_button_new();
+    gtk_menu_button_set_label(GTK_MENU_BUTTON(v->diagnostics), UI("진단 내보내기"));
+    gtk_box_append(GTK_BOX(box), v->diagnostics);
+    v->diagnostics_options = GTK_POPOVER(gtk_popover_new());
+    GtkWidget *options = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_start(options, 8);
+    gtk_widget_set_margin_end(options, 8);
+    gtk_widget_set_margin_top(options, 8);
+    gtk_widget_set_margin_bottom(options, 8);
+    gtk_popover_set_child(v->diagnostics_options, options);
+    v->diagnostics_root = gtk_check_button_new_with_label(UI("스캔 루트 경로 포함"));
+    gtk_box_append(GTK_BOX(options), v->diagnostics_root);
+    GtkWidget *report = gtk_button_new_with_label(UI("진단 JSON 저장"));
+    gtk_box_append(GTK_BOX(options), report);
+    g_signal_connect(report, "clicked", G_CALLBACK(diagnostics_save), v);
+    g_signal_connect(v->diagnostics_options, "closed", G_CALLBACK(diagnostics_reset), v);
+    gtk_menu_button_set_popover(GTK_MENU_BUTTON(v->diagnostics), GTK_WIDGET(v->diagnostics_options));
+    gtk_widget_set_tooltip_text(v->diagnostics, UI("기본 보고서는 경로와 파일명을 숨깁니다."));
     return box;
 }
 

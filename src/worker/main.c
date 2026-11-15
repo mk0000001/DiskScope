@@ -1,4 +1,5 @@
 #include "diskscope/ds_session.h"
+#include "diskscope/ds_retention.h"
 #include "diskscope/ds_store.h"
 #include "local.h"
 #include "cache_lease.h"
@@ -202,6 +203,7 @@ static DsStatus process(Worker *worker, DsScanOptions *options, DsError *error)
     status = ds_store_set_options(worker->store, options, error);
     if (status != DS_OK)
         return status;
+    ds_cache_mark_owned(worker->cache, true);
     if (options->profile == DS_CONSERVATIVE)
         lower_priority();
     send_stage(worker, DS_RUNNING);

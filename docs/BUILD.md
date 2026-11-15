@@ -42,7 +42,7 @@ cmake --preset release
 cmake --build --preset release
 ctest --preset release
 cpack --config build/release/CPackConfig.cmake -G DEB
-sudo apt install ./diskscope_0.1.1_amd64.deb
+sudo apt install ./diskscope_0.1.2_amd64.deb
 diskscope
 ```
 
@@ -60,3 +60,9 @@ diskscope-cli compare --before old.dscan --after result.dscan --output changes.j
 Use `--cache-dir` to choose another local cache base. The CLI accepts `--hide-hidden`, an optional basename `--exclude-pattern`, and repeatable `--exclude-path` options. A cancellation request can still produce a committed partial snapshot. A second Ctrl+C during backup cancels its publication. Exit codes are 0 for success, 2 for gaps, 3 for cancellation, 4 for invalid usage/input, and 5 for worker, I/O or resource failure.
 
 The export entry ID comes from a JSON or JSONL export. Selecting a file writes that row. Selecting a folder writes its row and all descendants. In the GUI, **필터 일치 전체** exports every row matching the active inputs and view type, including matches beyond the Top 100/1000 display cap. The selected metric is recorded alongside all three metric values.
+
+## Cache and diagnostics
+
+Use **저장** to keep a standalone `.dscan` outside the managed cache directories. DiskScope checks the configured local cache at startup recovery and before opening a snapshot or starting a scan. Eligible idle copies are subject to a 30-day age, 10-directory and 8 GiB retention policy. Active and displayed caches are leased, the latest eligible recovery is kept, and older caches without a verified ownership marker remain available for recovery where applicable.
+
+Choose **진단 내보내기** and **진단 JSON 저장** to save a local report. It includes the app and runtime versions and, when available, the worker state, scan status and issue counts by reason. Check **스캔 루트 경로 포함** for that export to include the displayed root path. Child names, cache paths, raw log messages and exclusion patterns are omitted in both modes.

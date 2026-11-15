@@ -29,7 +29,7 @@ struct DsCacheLease {
 static bool private_directory(const WCHAR *path)
 {
     HANDLE directory = CreateFileW(path, READ_CONTROL | FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     if (directory == INVALID_HANDLE_VALUE)
         return false;
@@ -74,8 +74,8 @@ done:
     return valid;
 }
 
-static DsCacheLease *open_lease(const char *folder, const char *name,
-                                bool create, bool exclusive, DsError *error)
+static DsCacheLease *open_lease(const char *folder, const char *name, bool create,
+                                bool exclusive, bool deleting, DsError *error)
 {
     char *directory = ds_win_extended_path(folder);
     char *path = ds_win_extended_path(name);
@@ -90,7 +90,7 @@ static DsCacheLease *open_lease(const char *folder, const char *name,
         ds_error(error, DS_INVALID, 0, "Cache lease requires a regular private directory");
         return NULL;
     }
-    HANDLE file = CreateFileW(wide_file, GENERIC_READ | GENERIC_WRITE,
+    HANDLE file = CreateFileW(wide_file, GENERIC_READ | GENERIC_WRITE | (deleting ? DELETE : 0),
         FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, create ? CREATE_NEW : OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     DWORD code = GetLastError();
@@ -125,19 +125,24 @@ static DsCacheLease *open_lease(const char *folder, const char *name,
     lease->created = (int64_t)(timestamp / 10);
     return lease;
 }
-#else
-static DsCacheLease *open_lease(const char *folder, const char *name,
-                                bool create, bool exclusive, DsError *error)
+
+DsCacheLease *ds_cache_lease_open_delete(const char *folder)
 {
-    (void)name;
-    int dir = open(folder, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (dir < 0) {
-        ds_error(error, DS_IO, errno, "Could not open the cache directory");
-        return NULL;
-    }
+    g_autofree char *path = g_build_filename(folder, DS_CACHE_LEASE_FILE, NULL);
+    return open_lease(folder, path, false, true, true, NULL);
+}
+
+bool ds_cache_lease_delete(DsCacheLease *lease)
+{
+    FILE_DISPOSITION_INFO disposition = {.DeleteFile = TRUE};
+    return SetFileInformationByHandle(lease->file, FileDispositionInfo,
+                                      &disposition, sizeof disposition);
+}
+#else
+DsCacheLease *ds_cache_lease_open_at(int dir, bool create, bool exclusive, DsError *error)
+{
     struct stat st;
     if (fstat(dir, &st) < 0 || st.st_uid != geteuid() || (st.st_mode & 0077)) {
-        close(dir);
         ds_error(error, DS_INVALID, 0, "Cache lease requires a private user directory");
         return NULL;
     }
@@ -146,7 +151,6 @@ static DsCacheLease *open_lease(const char *folder, const char *name,
         flags |= O_CREAT | O_EXCL;
     int fd = openat(dir, DS_CACHE_LEASE_FILE, flags, 0600);
     int code = errno;
-    close(dir);
     if (fd < 0) {
         ds_error(error, DS_IO, code, "Could not open the cache lease");
         return NULL;
@@ -169,6 +173,15 @@ static DsCacheLease *open_lease(const char *folder, const char *name,
     lease->created = (int64_t)st.st_mtim.tv_sec * G_USEC_PER_SEC + st.st_mtim.tv_nsec / 1000;
     return lease;
 }
+
+bool ds_cache_lease_delete_at(DsCacheLease *lease, int dir)
+{
+    struct stat file, link;
+    return fstat(lease->file, &file) == 0 && file.st_nlink == 1 &&
+           fstatat(dir, DS_CACHE_LEASE_FILE, &link, AT_SYMLINK_NOFOLLOW) == 0 &&
+           file.st_dev == link.st_dev && file.st_ino == link.st_ino &&
+           unlinkat(dir, DS_CACHE_LEASE_FILE, 0) == 0;
+}
 #endif
 
 DsCacheLease *ds_cache_lease_open(const char *folder, bool create, bool exclusive,
@@ -178,10 +191,19 @@ DsCacheLease *ds_cache_lease_open(const char *folder, bool create, bool exclusiv
         ds_error(error, DS_INVALID, 0, "Invalid cache directory");
         return NULL;
     }
-    char *name = g_build_filename(folder, DS_CACHE_LEASE_FILE, NULL);
-    DsCacheLease *lease = open_lease(folder, name, create, exclusive, error);
-    g_free(name);
+#ifdef G_OS_WIN32
+    g_autofree char *name = g_build_filename(folder, DS_CACHE_LEASE_FILE, NULL);
+    return open_lease(folder, name, create, exclusive, false, error);
+#else
+    int dir = open(folder, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dir < 0) {
+        ds_error(error, DS_IO, errno, "Could not open the cache directory");
+        return NULL;
+    }
+    DsCacheLease *lease = ds_cache_lease_open_at(dir, create, exclusive, error);
+    close(dir);
     return lease;
+#endif
 }
 
 void ds_cache_lease_close(DsCacheLease *lease)
