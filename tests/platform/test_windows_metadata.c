@@ -11,6 +11,13 @@ static WIN32_FIND_DATAW read_find_data(const WCHAR *path)
     return found;
 }
 
+static BOOL WINAPI query_identity_only(HANDLE handle, FILE_INFO_BY_HANDLE_CLASS cls,
+                                       LPVOID output, DWORD length)
+{
+    g_assert_cmpint(cls, ==, FileIdInfo);
+    return GetFileInformationByHandleEx(handle, cls, output, length);
+}
+
 static void measure_file(DWORD fsctl, DWORD required_attribute)
 {
     WCHAR *dir = fixture_directory();
@@ -44,7 +51,21 @@ static void measure_file(DWORD fsctl, DWORD required_attribute)
     g_assert_true(GetFileInformationByHandleEx(read_handle, FileStandardInfo, &standard, sizeof(standard)));
     g_assert_true(GetFileInformationByHandleEx(read_handle, FileIdInfo, &identity, sizeof(identity)));
     uint64_t expected_allocated = (uint64_t)standard.AllocationSize.QuadPart;
-    if (fsctl) {
+    if (!fsctl) {
+        FILE_BASIC_INFO basic, combined_basic;
+        FILE_STANDARD_INFO combined_standard;
+        g_assert_true(GetFileInformationByHandleEx(read_handle, FileBasicInfo, &basic, sizeof(basic)));
+        g_assert_nonnull(ds_win_metadata_ops.query_basic_standard);
+        g_assert_true(ds_win_metadata_ops.query_basic_standard(read_handle, &combined_basic,
+                                                              &combined_standard));
+        g_assert_cmpuint(combined_basic.FileAttributes, ==, basic.FileAttributes);
+        g_assert_cmpint(combined_basic.LastWriteTime.QuadPart, ==, basic.LastWriteTime.QuadPart);
+        g_assert_cmpint(combined_standard.AllocationSize.QuadPart, ==, standard.AllocationSize.QuadPart);
+        g_assert_cmpint(combined_standard.EndOfFile.QuadPart, ==, standard.EndOfFile.QuadPart);
+        g_assert_cmpuint(combined_standard.NumberOfLinks, ==, standard.NumberOfLinks);
+        g_assert_cmpint(combined_standard.DeletePending, ==, standard.DeletePending);
+        g_assert_cmpint(combined_standard.Directory, ==, standard.Directory);
+    } else {
         FILE_COMPRESSION_INFO compression;
         g_assert_true(GetFileInformationByHandleEx(read_handle, FileCompressionInfo,
                                                    &compression, sizeof(compression)));
@@ -56,7 +77,9 @@ static void measure_file(DWORD fsctl, DWORD required_attribute)
     g_assert_cmpuint(found.dwFileAttributes & required_attribute, ==, required_attribute);
     DsEntry entry = {0};
     ds_win_find_metadata(&found, &entry);
-    ds_win_measure_file(&ds_win_metadata_ops, path, NULL, &found, &entry);
+    DsWinMetadataOps ops = ds_win_metadata_ops;
+    if (!fsctl) ops.query = query_identity_only;
+    ds_win_measure_file(&ops, path, NULL, &found, &entry);
     g_assert_cmpint(entry.kind, ==, DS_FILE);
     g_assert_cmpint(entry.reason, ==, DS_REASON_NONE);
     g_assert_cmpint(entry.logical.quality, ==, DS_KNOWN);
@@ -81,6 +104,120 @@ static void standard_file(void) { measure_file(0, 0); }
 static void sparse_file(void) { measure_file(FSCTL_SET_SPARSE, FILE_ATTRIBUTE_SPARSE_FILE); }
 static void compressed_file(void) { measure_file(FSCTL_SET_COMPRESSION, FILE_ATTRIBUTE_COMPRESSED); }
 
+static void parent_relative_metadata(void)
+{
+    WCHAR *dir = fixture_directory();
+    if (!dir) return;
+    WCHAR *parent = fixture_path(dir, L"parent");
+    WCHAR *moved = fixture_path(dir, L"moved");
+    const WCHAR raw_name[] = {L'r', 0xd800, L'w', 0};
+    WCHAR *file = fixture_path(parent, raw_name);
+    g_assert_true(CreateDirectoryW(parent, NULL));
+    HANDLE writable = fixture_open(file, CREATE_NEW);
+    fixture_write(writable);
+    g_assert_true(CloseHandle(writable));
+    WIN32_FIND_DATAW found = read_find_data(file);
+    g_assert_cmpmem(found.cFileName, sizeof(raw_name), raw_name, sizeof(raw_name));
+
+    HANDLE directory;
+    DsWinNode node;
+    g_assert_cmpuint(ds_win_open_node(&ds_win_metadata_ops, parent, true, &directory, &node),
+                     ==, ERROR_SUCCESS);
+    g_assert_true(node.id_known);
+    g_assert_true(ds_win_prepare_ntfs_metadata());
+    DsEntry expected = {0};
+    ds_win_find_metadata(&found, &expected);
+    ds_win_measure_file(&ds_win_metadata_ops, file, &node, &found, &expected);
+    g_assert_true(expected.identity_known);
+
+    /* The held directory still names the observed file after its old path
+     * has been replaced by a different ordinary file. */
+    g_assert_true(MoveFileExW(parent, moved, 0));
+    g_assert_true(CreateDirectoryW(parent, NULL));
+    g_assert_true(CloseHandle(fixture_open(file, CREATE_NEW)));
+    DsEntry relative = {0};
+    ds_win_find_metadata(&found, &relative);
+    g_assert_true(ds_win_measure_ntfs_file(directory, &node, &found, &relative));
+    g_assert_cmpint(relative.reason, ==, DS_REASON_NONE);
+    g_assert_cmpint(relative.logical.quality, ==, DS_KNOWN);
+    g_assert_cmpuint(relative.logical.bytes, ==, expected.logical.bytes);
+    g_assert_cmpint(relative.allocated.quality, ==, DS_KNOWN);
+    g_assert_cmpuint(relative.allocated.bytes, ==, expected.allocated.bytes);
+    g_assert_cmpuint(relative.links, ==, expected.links);
+    g_assert_true(relative.identity_known);
+    g_assert_cmpmem(relative.identity, sizeof(relative.identity), expected.identity, sizeof(expected.identity));
+
+    WCHAR *moved_file = fixture_path(moved, raw_name);
+    WCHAR *hardlink = fixture_path(moved, L"alias.bin");
+    g_assert_true(CreateHardLinkW(hardlink, moved_file, NULL));
+    relative = (DsEntry){0};
+    ds_win_find_metadata(&found, &relative);
+    g_assert_true(ds_win_measure_ntfs_file(directory, &node, &found, &relative));
+    g_assert_cmpint(relative.reason, ==, DS_REASON_NONE);
+    g_assert_cmpuint(relative.allocated.bytes, ==, expected.allocated.bytes);
+    g_assert_cmpuint(relative.links, ==, 2);
+    g_assert_true(relative.identity_known);
+    g_assert_cmpmem(relative.identity, sizeof(relative.identity), expected.identity, sizeof(expected.identity));
+    g_assert_true(CloseHandle(directory));
+    g_assert_true(DeleteFileW(hardlink));
+    g_assert_true(DeleteFileW(moved_file));
+    g_assert_true(DeleteFileW(file));
+    g_assert_true(RemoveDirectoryW(moved));
+    g_assert_true(RemoveDirectoryW(parent));
+    g_assert_true(RemoveDirectoryW(dir));
+    g_free(hardlink);
+    g_free(moved_file);
+    g_free(file);
+    g_free(moved);
+    g_free(parent);
+    g_free(dir);
+}
+
+static void long_parent_relative_metadata(void)
+{
+    WCHAR *dir = fixture_directory();
+    if (!dir) return;
+    WCHAR *parents[8] = {dir};
+    WCHAR component[101];
+    wmemset(component, L'x', G_N_ELEMENTS(component) - 1);
+    component[G_N_ELEMENTS(component) - 1] = 0;
+    for (size_t i = 1; i < G_N_ELEMENTS(parents); ++i) {
+        parents[i] = fixture_path(parents[i - 1], component);
+        g_assert_true(CreateDirectoryW(parents[i], NULL));
+    }
+    const WCHAR *parent_path = parents[G_N_ELEMENTS(parents) - 1];
+    WCHAR *path = fixture_path(parent_path, L"long-parent.bin");
+    HANDLE file = fixture_open(path, CREATE_NEW);
+    fixture_write(file);
+    g_assert_true(CloseHandle(file));
+    const WIN32_FIND_DATAW found = read_find_data(path);
+    HANDLE parent;
+    DsWinNode node;
+    g_assert_cmpuint(ds_win_open_node(&ds_win_metadata_ops, parent_path, true, &parent, &node),
+                     ==, ERROR_SUCCESS);
+    g_assert_true(ds_win_prepare_ntfs_metadata());
+    DsEntry reference = {0}, relative = {0};
+    ds_win_find_metadata(&found, &reference);
+    ds_win_find_metadata(&found, &relative);
+    ds_win_measure_file(&ds_win_metadata_ops, path, &node, &found, &reference);
+    g_assert_true(ds_win_measure_ntfs_file(parent, &node, &found, &relative));
+    g_assert_true(CloseHandle(parent));
+    g_assert_cmpint(relative.reason, ==, DS_REASON_NONE);
+    g_assert_cmpint(relative.allocated.quality, ==, DS_KNOWN);
+    g_assert_cmpuint(relative.allocated.bytes, ==, reference.allocated.bytes);
+    g_assert_cmpuint(relative.logical.bytes, ==, reference.logical.bytes);
+    g_assert_cmpuint(relative.links, ==, reference.links);
+    g_assert_true(relative.identity_known);
+    g_assert_cmpmem(relative.identity, sizeof(relative.identity), reference.identity,
+                    sizeof(reference.identity));
+    g_assert_true(DeleteFileW(path));
+    g_free(path);
+    for (size_t i = G_N_ELEMENTS(parents); i-- > 0;) {
+        g_assert_true(RemoveDirectoryW(parents[i]));
+        g_free(parents[i]);
+    }
+}
+
 static HANDLE WINAPI sharing_violation(LPCWSTR path, DWORD access, DWORD share,
                                        LPSECURITY_ATTRIBUTES security, DWORD disposition,
                                        DWORD flags, HANDLE template)
@@ -88,10 +225,10 @@ static HANDLE WINAPI sharing_violation(LPCWSTR path, DWORD access, DWORD share,
     (void)path;
     (void)security;
     (void)template;
-    g_assert_true(access == 0 || access == FILE_READ_ATTRIBUTES);
+    g_assert_cmpuint(access, ==, FILE_READ_ATTRIBUTES);
     g_assert_cmpuint(share, ==, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
     g_assert_cmpuint(disposition, ==, OPEN_EXISTING);
-    g_assert_cmpuint(flags & FILE_FLAG_OPEN_REPARSE_POINT, !=, 0);
+    g_assert_cmpuint(flags, ==, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL);
     SetLastError(ERROR_SHARING_VIOLATION);
     return INVALID_HANDLE_VALUE;
 }
@@ -136,6 +273,7 @@ static void absent_optional_queries(void)
     const WIN32_FIND_DATAW found = read_find_data(path);
     DsWinMetadataOps ops = ds_win_metadata_ops;
     ops.query = query_without_optional_classes;
+    ops.query_basic_standard = NULL;
     DsEntry entry = {0};
     ds_win_find_metadata(&found, &entry);
     ds_win_measure_file(&ops, path, NULL, &found, &entry);
@@ -162,6 +300,14 @@ static BOOL WINAPI query_after_reparse_change(HANDLE handle, FILE_INFO_BY_HANDLE
     return TRUE;
 }
 
+static bool query_combined_after_reparse_change(HANDLE handle, FILE_BASIC_INFO *basic,
+                                               FILE_STANDARD_INFO *standard)
+{
+    if (!ds_win_metadata_ops.query_basic_standard(handle, basic, standard)) return false;
+    basic->FileAttributes |= FILE_ATTRIBUTE_REPARSE_POINT;
+    return true;
+}
+
 static void reparse_replacement_rechecked(void)
 {
     WCHAR *dir = fixture_directory();
@@ -171,6 +317,7 @@ static void reparse_replacement_rechecked(void)
     const WIN32_FIND_DATAW found = read_find_data(path);
     DsWinMetadataOps ops = ds_win_metadata_ops;
     ops.query = query_after_reparse_change;
+    ops.query_basic_standard = query_combined_after_reparse_change;
     DsEntry entry = {0};
     ds_win_find_metadata(&found, &entry);
     ds_win_measure_file(&ops, path, NULL, &found, &entry);
@@ -213,6 +360,8 @@ int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/windows/metadata/standard", standard_file);
+    g_test_add_func("/windows/metadata/parent-relative", parent_relative_metadata);
+    g_test_add_func("/windows/metadata/long-parent-relative", long_parent_relative_metadata);
     g_test_add_func("/windows/metadata/sparse", sparse_file);
     g_test_add_func("/windows/metadata/compressed", compressed_file);
     g_test_add_func("/windows/metadata/sharing-violation", metadata_open_failure);

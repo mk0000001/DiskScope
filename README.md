@@ -1,5 +1,7 @@
 # DiskScope
 
+<img src="resources/diskscope.svg" alt="DiskScope logo" width="72" height="72">
+
 [한국어](#한국어) · [English](#english)
 
 ## 한국어
@@ -7,6 +9,8 @@
 DiskScope는 Windows와 Linux에서 어떤 폴더와 파일이 디스크 공간을 많이 쓰는지 살펴보는 읽기 전용 분석기입니다. 한국어 GUI와 명령줄 도구가 같은 스캔 엔진을 사용합니다.
 
 ### 다운로드 및 실행
+
+Windows에서 기본 스캔·저장 속도를 개선한 빌드는 [Windows 성능 프리뷰 1](https://github.com/mk0000001/DiskScope/releases/tag/v0.1.3-perf.1)에서 받을 수 있습니다. ZIP 전체를 풀고 `bin\diskscope.exe`를 실행하세요. [반복 측정과 검증 범위](docs/VALIDATION.md#windows-performance-preview)를 확인할 수 있습니다.
 
 [DiskScope 0.1.3 프리뷰 릴리스](https://github.com/mk0000001/DiskScope/releases/tag/v0.1.3-preview)에서 운영체제에 맞는 파일을 받으세요. 패키지의 SHA-256은 릴리스의 `DiskScope-0.1.3-SHA256SUMS`와 대조할 수 있습니다.
 
@@ -64,6 +68,8 @@ diskscope-cli compare --before before.dscan --after result.dscan --output change
 DiskScope is a read-only disk usage analyzer for Windows and Linux. Use it to see which folders and files take up the most space. Its Korean-language GUI and command-line tool use the same scanning engine.
 
 ### Download and run
+
+The [Windows Performance Preview 1](https://github.com/mk0000001/DiskScope/releases/tag/v0.1.3-perf.1) improves default scan and save speed. Extract the whole ZIP and run `bin\diskscope.exe`. See the [repeated measurements and validation coverage](docs/VALIDATION.md#windows-performance-preview).
 
 Get the package for your operating system from the [DiskScope 0.1.3 preview release](https://github.com/mk0000001/DiskScope/releases/tag/v0.1.3-preview). You can verify the package SHA-256 against `DiskScope-0.1.3-SHA256SUMS` on the release page.
 

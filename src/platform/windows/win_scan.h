@@ -7,10 +7,14 @@
 #include <windows.h>
 #include "diskscope/ds_scan.h"
 
+/* Includes the prefix and terminating NUL. Native limits may be lower. */
+#define DS_WIN_PATH_UNITS 32767u
+
 typedef struct {
     HANDLE (WINAPI *open)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
     BOOL (WINAPI *query)(HANDLE, FILE_INFO_BY_HANDLE_CLASS, LPVOID, DWORD);
     BOOL (WINAPI *close)(HANDLE);
+    bool (*query_basic_standard)(HANDLE, FILE_BASIC_INFO *, FILE_STANDARD_INFO *);
 } DsWinMetadataOps;
 
 typedef struct {
@@ -34,6 +38,10 @@ void ds_win_find_metadata(const WIN32_FIND_DATAW *found, DsEntry *entry);
 void ds_win_measure_file(const DsWinMetadataOps *ops, const WCHAR *path,
                          const DsWinNode *root, const WIN32_FIND_DATAW *found,
                          DsEntry *entry);
+bool ds_win_prepare_ntfs_metadata(void);
+/* Requires successful preparation and a verified directory on root's NTFS volume. */
+bool ds_win_measure_ntfs_file(HANDLE directory, const DsWinNode *root,
+                              const WIN32_FIND_DATAW *found, DsEntry *entry);
 bool ds_win_same_volume(const DsWinNode *a, const DsWinNode *b);
 bool ds_win_same_node(const DsWinNode *a, const DsWinNode *b);
 DsVolumeInfo ds_win_volume_info(HANDLE root);

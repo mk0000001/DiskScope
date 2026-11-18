@@ -4,19 +4,24 @@
 typedef struct {
     DsControl *control;
     unsigned ignore;
-    gint done;
+    GMutex lock;
+    GCond completed;
+    bool done;
 } SnapshotInterrupt;
 
 static gpointer snapshot_interrupt(gpointer ptr)
 {
     SnapshotInterrupt *state = ptr;
-    while (!g_atomic_int_get(&state->done)) {
+    g_mutex_lock(&state->lock);
+    while (!state->done) {
         if (ds_cli_interrupt_count() > state->ignore) {
             ds_control_cancel(state->control);
             break;
         }
-        g_usleep(20000);
+        g_cond_wait_until(&state->completed, &state->lock,
+                          g_get_monotonic_time() + 20 * G_TIME_SPAN_MILLISECOND);
     }
+    g_mutex_unlock(&state->lock);
     return NULL;
 }
 
@@ -107,7 +112,7 @@ int ds_cli_scan(int argc, char **argv)
             g_printerr("%s (%" G_GUINT64_FORMAT " entries)\n", stage, event.observations);
             prev = event;
         }
-        g_usleep(50000);
+        ds_session_wait_exit(session, g_get_monotonic_time() + 50 * G_TIME_SPAN_MILLISECOND);
     }
     status = event.result;
     if (event.detail[0])
@@ -119,11 +124,18 @@ int ds_cli_scan(int argc, char **argv)
         if (saved == DS_OK) {
             DsControl save_control;
             ds_control_init(&save_control);
-            SnapshotInterrupt stop = {&save_control, status == DS_CANCELED ? 1u : 0u, 0};
+            SnapshotInterrupt stop = {.control = &save_control, .ignore = status == DS_CANCELED ? 1u : 0u};
+            g_mutex_init(&stop.lock);
+            g_cond_init(&stop.completed);
             GThread *watch = g_thread_new("ds-backup-interrupt", snapshot_interrupt, &stop);
             saved = ds_snapshot_save(reader, &output, &save_control, &save_error);
-            g_atomic_int_set(&stop.done, 1);
+            g_mutex_lock(&stop.lock);
+            stop.done = true;
+            g_cond_signal(&stop.completed);
+            g_mutex_unlock(&stop.lock);
             g_thread_join(watch);
+            g_cond_clear(&stop.completed);
+            g_mutex_clear(&stop.lock);
             ds_control_clear(&save_control);
         }
         ds_store_close(reader);

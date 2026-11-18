@@ -161,25 +161,14 @@ static int append_and_exit(const char *folder)
     if (ds_store_open(&path, DS_STORE_WRITER, &db, &error) != DS_OK)
         g_error("WAL fixture writer could not open: %s (%" G_GINT64_FORMAT ")", error.message,
                 error.os_code);
-    /* Stage an actual observation commit without the normal checkpoint. */
-    DsNativePath entry = {0};
-    g_assert_cmpint(ds_path_from_arg("committed-before-exit", &entry, NULL), ==, DS_OK);
-    size_t length;
-    const void *bytes = g_bytes_get_data(entry.raw, &length);
-    sqlite3 *sql = ds_store_db(db);
-    sqlite3_stmt *append = NULL;
-    g_assert_cmpint(sqlite3_exec(sql, "BEGIN IMMEDIATE", NULL, NULL, NULL), ==, SQLITE_OK);
-    g_assert_cmpint(sqlite3_prepare_v2(sql,
-        "INSERT INTO entries(id,parent_id,name,name_encoding,display,kind,reason,os_code,"
-        " logical,logical_quality,allocated,allocated_quality,identity,links,mtime,commit_seq)"
-        " VALUES(2,1,?1,?2,'committed-before-exit',2,0,0,x'0000000000000007',0,"
-        " NULL,1,NULL,x'0000000000000001',NULL,2)", -1, &append, NULL), ==, SQLITE_OK);
-    g_assert_cmpint(sqlite3_bind_blob64(append, 1, bytes, length, SQLITE_STATIC), ==, SQLITE_OK);
-    g_assert_cmpint(sqlite3_bind_int(append, 2, entry.encoding), ==, SQLITE_OK);
-    g_assert_cmpint(sqlite3_step(append), ==, SQLITE_DONE);
-    g_assert_cmpint(sqlite3_finalize(append), ==, SQLITE_OK);
-    g_assert_cmpint(sqlite3_exec(sql, "UPDATE scans SET entry_count=2,commit_seq=2; COMMIT",
-                                 NULL, NULL, NULL), ==, SQLITE_OK);
+    DsEntry entry = {.id = 2, .parent_id = 1, .kind = DS_FILE, .logical = {7, DS_KNOWN},
+                     .allocated = {0, DS_UNAVAILABLE}, .links = 1};
+    g_assert_cmpint(ds_path_from_arg("committed-before-exit", &entry.name, NULL), ==, DS_OK);
+    g_assert_cmpint(ds_store_append(db, &(DsEntryBatch){&entry, 1}, NULL), ==, DS_OK);
+    int frames = -1, checkpointed = -1;
+    g_assert_cmpint(sqlite3_wal_checkpoint_v2(ds_store_db(db), "main", SQLITE_CHECKPOINT_NOOP,
+                                            &frames, &checkpointed), ==, SQLITE_OK);
+    g_assert_cmpint(frames, >, checkpointed);
     /* Keep the SQLite connection and OS lease open until the process exits. */
     _Exit(0);
 }

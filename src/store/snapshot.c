@@ -37,6 +37,10 @@ DsStatus ds_snapshot_save(DsStore *reader, const DsNativePath *destination,
     output.fd = -1;
     sqlite3 *db = NULL;
     int code = sqlite3_open_v2(output.temporary, &db, SQLITE_OPEN_READWRITE, DS_FILE_VFS);
+    /* The fresh staging file is private to the backup and discarded on
+     * failure. Keep rollback state in memory and SQLite's database sync. */
+    if (code == SQLITE_OK)
+        code = sqlite3_exec(db, "PRAGMA journal_mode=MEMORY; PRAGMA synchronous=FULL", NULL, NULL, NULL);
     sqlite3_backup *copy = code == SQLITE_OK ?
         sqlite3_backup_init(db, "main", ds_store_db(reader), "main") : NULL;
     if (copy) {
@@ -63,8 +67,11 @@ DsStatus ds_snapshot_save(DsStore *reader, const DsNativePath *destination,
     } else if (code == SQLITE_OK) {
         code = sqlite3_errcode(db);
     }
-    if (db)
-        sqlite3_close(db);
+    if (db) {
+        int closed = sqlite3_close(db);
+        if (code == SQLITE_OK)
+            code = closed;
+    }
     if (ds_control_canceled(control))
         status = DS_CANCELED;
     else if (code != SQLITE_OK)

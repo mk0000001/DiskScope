@@ -188,6 +188,76 @@ static void drive_root_pattern(void)
     ds_path_clear(&value);
 }
 
+typedef struct {
+    Observations observations;
+    const WCHAR *root, *retired, *replacement_file;
+    bool replaced;
+} RenamedRoot;
+
+static DsStatus replace_root_after_batch(const DsEntryBatch *batch, void *data, DsError *error)
+{
+    RenamedRoot *race = data;
+    DsStatus status = collect(batch, &race->observations, error);
+    if (status == DS_OK && !race->replaced) {
+        g_assert_true(MoveFileExW(race->root, race->retired, 0));
+        g_assert_true(CreateDirectoryW(race->root, NULL));
+        g_assert_true(CloseHandle(fixture_open(race->replacement_file, CREATE_NEW)));
+        race->replaced = true;
+    }
+    return status;
+}
+
+static void detect_renamed_root(void)
+{
+    WCHAR *dir = fixture_directory();
+    if (!dir) return;
+    WCHAR *root = fixture_path(dir, L"root");
+    WCHAR *retired = fixture_path(dir, L"retired");
+    WCHAR *replacement = fixture_path(root, L"replacement.bin");
+    g_assert_true(CreateDirectoryW(root, NULL));
+    for (unsigned i = 0; i < DS_BATCH_MAX + 2; ++i) {
+        WCHAR leaf[24];
+        swprintf(leaf, G_N_ELEMENTS(leaf), L"file-%04u.bin", i);
+        WCHAR *file = fixture_path(root, leaf);
+        g_assert_true(CloseHandle(fixture_open(file, CREATE_NEW)));
+        g_free(file);
+    }
+    DsScanOptions options;
+    fixture_set_root(&options, root);
+    RenamedRoot race = {
+        .observations.entries = g_hash_table_new_full(g_bytes_hash, g_bytes_equal,
+                                                     (GDestroyNotify)g_bytes_unref, g_free),
+        .root = root, .retired = retired, .replacement_file = replacement,
+    };
+    DsStatus status = ds_walk(&options, NULL, replace_root_after_batch, &race, NULL);
+    const DsEntry *root_entry = observed(&race.observations, L"");
+    g_assert_true(race.replaced);
+    g_assert_nonnull(root_entry);
+    g_assert_cmpint(status, ==, DS_PARTIAL);
+    g_assert_cmpint(root_entry->reason, ==, DS_REASON_CHANGED);
+    WCHAR last_leaf[24];
+    swprintf(last_leaf, G_N_ELEMENTS(last_leaf), L"file-%04u.bin", DS_BATCH_MAX + 1);
+    g_assert_null(observed(&race.observations, last_leaf));
+    g_assert_null(observed(&race.observations, L"replacement.bin"));
+    g_hash_table_unref(race.observations.entries);
+    ds_path_clear(&options.root);
+    for (unsigned i = 0; i < DS_BATCH_MAX + 2; ++i) {
+        WCHAR leaf[24];
+        swprintf(leaf, G_N_ELEMENTS(leaf), L"file-%04u.bin", i);
+        WCHAR *file = fixture_path(retired, leaf);
+        g_assert_true(DeleteFileW(file));
+        g_free(file);
+    }
+    g_assert_true(DeleteFileW(replacement));
+    g_assert_true(RemoveDirectoryW(root));
+    g_assert_true(RemoveDirectoryW(retired));
+    g_assert_true(RemoveDirectoryW(dir));
+    g_free(replacement);
+    g_free(retired);
+    g_free(root);
+    g_free(dir);
+}
+
 static void cloud_and_offline_classification(void)
 {
     g_assert_cmpint(ds_win_classify(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT,
@@ -304,7 +374,11 @@ static void standard_profile_metadata_helper(void)
     if (!dir) return;
     WCHAR *first = fixture_path(dir, L"alpha.bin");
     WCHAR *second = fixture_path(dir, L"zeta.bin");
-    g_assert_true(CloseHandle(fixture_open(first, CREATE_NEW)));
+    HANDLE written_file = fixture_open(first, CREATE_NEW);
+    DWORD written = 0;
+    g_assert_true(WriteFile(written_file, "a", 1, &written, NULL));
+    g_assert_cmpuint(written, ==, 1);
+    g_assert_true(CloseHandle(written_file));
     g_assert_true(CloseHandle(fixture_open(second, CREATE_NEW)));
 
     DsScanOptions options;
@@ -347,6 +421,8 @@ static void standard_profile_metadata_helper(void)
     g_assert_cmpuint(metadata.pauses, ==, 1);
     g_assert_cmpint(observed(&found, L"alpha.bin")->allocated.quality, ==, DS_KNOWN);
     g_assert_cmpint(observed(&found, L"zeta.bin")->allocated.quality, ==, DS_KNOWN);
+    g_assert_cmpuint(observed(&found, L"alpha.bin")->logical.bytes, ==, 1);
+    g_assert_cmpuint(observed(&found, L"zeta.bin")->logical.bytes, ==, 0);
     g_hash_table_unref(found.entries);
 }
 
@@ -355,6 +431,7 @@ int main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/windows/walk/local-ntfs", scan_local_fixture);
     g_test_add_func("/windows/walk/drive-root-pattern", drive_root_pattern);
+    g_test_add_func("/windows/walk/renamed-root", detect_renamed_root);
     g_test_add_func("/windows/walk/placeholder-attributes", cloud_and_offline_classification);
     g_test_add_func("/windows/walk/deep-ancestors", resume_deep_ancestors);
     g_test_add_func("/windows/walk/standard-metadata-helper", standard_profile_metadata_helper);

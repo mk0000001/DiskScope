@@ -4,14 +4,15 @@
 #include "cache_lease.h"
 #include "diskscope/ds_retention.h"
 #include "protocol.h"
+#include "worker_process.h"
 
 #include <gio/gio.h>
 
 struct DsSession {
     gatomicrefcount references;
     GMutex lock;
-    GCond changed;
-    GSubprocess *child;
+    GCond changed, exited;
+    DsWorkerProcess child;
     DsNativePath db;
     DsCacheLease *lease;
     char *id;
@@ -35,12 +36,13 @@ void ds_session_unref(DsSession *session)
 {
     if (!session || !g_atomic_ref_count_dec(&session->references))
         return;
-    g_object_unref(session->child);
+    ds_worker_process_clear(&session->child);
     ds_cache_lease_close(session->lease);
     ds_path_clear(&session->db);
     g_free(session->id);
     json_object_unref(session->start);
     g_cond_clear(&session->changed);
+    g_cond_clear(&session->exited);
     g_mutex_clear(&session->lock);
     g_free(session);
 }
@@ -54,6 +56,14 @@ void ds_session_event(DsSession *session, DsSessionEvent *event)
         if (session->cancel && now - session->cancellation_at >= 2 * G_TIME_SPAN_SECOND)
             event->stage = DS_CANCEL_WAITING;
         event->stalled = now - session->progress_at >= 10 * G_TIME_SPAN_SECOND;
+    }
+    g_mutex_unlock(&session->lock);
+}
+
+void ds_session_wait_exit(DsSession *session, int64_t deadline)
+{
+    g_mutex_lock(&session->lock);
+    while (!session->event.exited && g_cond_wait_until(&session->exited, &session->lock, deadline)) {
     }
     g_mutex_unlock(&session->lock);
 }
@@ -99,7 +109,7 @@ void ds_session_request_cancel(DsSession *s) { request(s, DS_MSG_CANCEL); }
 
 static bool send_message(DsSession *s, DsMessageType type, int64_t seq, JsonObject *obj)
 {
-    GOutputStream *pipe = g_subprocess_get_stdin_pipe(s->child);
+    GOutputStream *pipe = s->child.commands;
     GBytes *frame = ds_message_frame(type, s->id, seq, obj, NULL);
     if (!frame)
         return false;
@@ -129,7 +139,7 @@ static gpointer send_commands(gpointer ptr)
         if (cmd == DS_MSG_CANCEL)
             break;
     }
-    g_output_stream_close(g_subprocess_get_stdin_pipe(s->child), NULL, NULL);
+    g_output_stream_close(s->child.commands, NULL, NULL);
     ds_session_unref(s);
     return NULL;
 }
@@ -221,7 +231,7 @@ static bool reconcile_cache(DsSession *s, int result, DsError *error)
 static gpointer receive_events(gpointer ptr)
 {
     DsSession *s = ptr;
-    GInputStream *pipe = g_subprocess_get_stdout_pipe(s->child);
+    GInputStream *pipe = s->child.events;
     int64_t seq = 0;
     bool hello = false, finished = false, valid = true;
     for (;;) {
@@ -253,13 +263,12 @@ static gpointer receive_events(gpointer ptr)
         }
     }
     if (!valid)
-        g_subprocess_force_exit(s->child);
+        ds_worker_process_force_exit(&s->child);
     g_mutex_lock(&s->lock);
     s->stopping = true;
     g_cond_signal(&s->changed);
     g_mutex_unlock(&s->lock);
-    bool normal = g_subprocess_wait(s->child, NULL, NULL) &&
-                  g_subprocess_get_successful(s->child) && valid && hello && finished;
+    bool normal = ds_worker_process_wait(&s->child) && valid && hello && finished;
     g_mutex_lock(&s->lock);
     bool late_cancel = normal && s->cancel &&
                        (s->event.result == DS_OK || s->event.result == DS_PARTIAL);
@@ -282,6 +291,7 @@ static gpointer receive_events(gpointer ptr)
             g_strlcpy(s->event.detail, recovery.message, sizeof s->event.detail);
     }
     g_atomic_int_set(&active_scan, 0);
+    g_cond_broadcast(&s->exited);
     g_mutex_unlock(&s->lock);
     notify(s);
     ds_session_unref(s);
@@ -359,15 +369,13 @@ DsSession *ds_session_start(const DsScanOptions *options, DsSessionCallback call
     if (database && ds_path_from_arg(root, &native_root, error) == DS_OK &&
         ds_path_from_arg(cache, &native_cache, error) == DS_OK &&
         ds_path_from_arg(database, &native_db, error) == DS_OK) {
-        GError *failure = NULL;
-        GSubprocess *child = g_subprocess_new(
-            G_SUBPROCESS_FLAGS_STDIN_PIPE | G_SUBPROCESS_FLAGS_STDOUT_PIPE |
-            G_SUBPROCESS_FLAGS_STDERR_SILENCE, &failure, worker, NULL);
-        if (child) {
+        DsWorkerProcess child;
+        if (ds_worker_process_start(&child, worker, error)) {
             s = g_new0(DsSession, 1);
             g_atomic_ref_count_init(&s->references);
             g_mutex_init(&s->lock);
             g_cond_init(&s->changed);
+            g_cond_init(&s->exited);
             s->lease = lease;
             lease = NULL;
             s->db = native_db;
@@ -381,9 +389,6 @@ DsSession *ds_session_start(const DsScanOptions *options, DsSessionCallback call
             s->start = start_payload(options, &native_root, &native_cache);
             g_thread_unref(g_thread_new("ds-controller-write", send_commands, session_ref(s)));
             g_thread_unref(g_thread_new("ds-controller-read", receive_events, session_ref(s)));
-        } else {
-            ds_error(error, DS_IO, failure->code, "%s", failure->message);
-            g_error_free(failure);
         }
     }
     ds_cache_lease_close(lease);

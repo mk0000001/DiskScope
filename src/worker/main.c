@@ -3,6 +3,7 @@
 #include "diskscope/ds_store.h"
 #include "local.h"
 #include "cache_lease.h"
+#include "batches.h"
 #include "protocol.h"
 
 #include <errno.h>
@@ -29,6 +30,7 @@ typedef struct {
     char id[37];
     int64_t sequence;
     DsStore *store;
+    DsBatchWriter *writer;
     char *cache;
     DsCacheLease *lease;
     uint64_t cache_budget;
@@ -83,7 +85,9 @@ static gpointer beat(gpointer data)
 
 static void pause_callback(bool paused, void *data)
 {
-    send_stage(data, paused ? DS_PAUSED : DS_RUNNING);
+    Worker *worker = data;
+    if (!paused || ds_batch_writer_drain(worker->writer, NULL) == DS_OK)
+        send_stage(worker, paused ? DS_PAUSED : DS_RUNNING);
 }
 
 static bool receive(const char *id, int64_t sequence, DsMessage *out)
@@ -215,8 +219,23 @@ static DsStatus process(Worker *worker, DsScanOptions *options, DsError *error)
     char *cache_base = g_path_get_dirname(worker->cache);
     status = ds_path_from_arg(cache_base, &walk.cache_path, error);
     g_free(cache_base);
-    if (status == DS_OK)
-        status = ds_walk(&walk, &worker->control, append, worker, error);
+    if (status == DS_OK) {
+#ifdef G_OS_WIN32
+        /* One target-metadata lane in conservative mode. The separate sink
+         * owns this SQLite connection while writing batches to the cache. */
+        worker->writer = ds_batch_writer_new(append, worker, &worker->control);
+#endif
+        status = ds_walk(&walk, &worker->control,
+            worker->writer ? ds_batch_writer_enqueue : append,
+            worker->writer ? (void *)worker->writer : worker, error);
+        DsError write_error = {0};
+        DsStatus written = ds_batch_writer_finish(worker->writer, &write_error);
+        worker->writer = NULL;
+        if (written != DS_OK) {
+            status = written;
+            *error = write_error;
+        }
+    }
     ds_path_clear(&walk.cache_path);
     if (ds_control_canceled(&worker->control) && (status == DS_OK || status == DS_PARTIAL))
         status = DS_CANCELED;
@@ -227,7 +246,12 @@ static DsStatus process(Worker *worker, DsScanOptions *options, DsError *error)
         if (capacity(worker)) {
             send_stage(worker, DS_FINALIZING);
             DsCoverage coverage = status == DS_OK ? DS_COVERAGE_COMPLETE : DS_COVERAGE_PARTIAL;
-            DsStatus finalized = ds_finalize_result(worker->store, status, coverage, &worker->control, error);
+            DsStatus finalized = DS_OK;
+#ifdef G_OS_WIN32
+            finalized = ds_store_prepare_terminal_wal(worker->store, error);
+#endif
+            if (finalized == DS_OK)
+                finalized = ds_finalize_result(worker->store, status, coverage, &worker->control, error);
             if (finalized == DS_OK)
                 return status;
             status = finalized;

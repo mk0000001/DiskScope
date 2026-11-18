@@ -19,6 +19,9 @@ struct DsStore {
     int schema_version;
     uint64_t budget;
     uint64_t page_size;
+    int wal_frames;
+    int wal_checkpoint_at;
+    bool terminal_wal;
 };
 
 DsStatus ds_sql_status(DsStore *store, int code, DsError *error);
@@ -33,7 +36,7 @@ int ds_store_read_volume(DsStore *store, DsVolumeInfo *volume);
 bool ds_sql_progress(void *control);
 int ds_sql_interrupt(void *control);
 int ds_store_check_budget(DsStore *store, bool collecting);
-void ds_store_checkpoint(DsStore *store);
+void ds_store_checkpoint(DsStore *store, bool force);
 int ds_query_register_functions(DsStore *store);
 int ds_query_prepare_entry(DsStore *store, sqlite3_stmt **stmt, int64_t generation);
 int ds_query_step_entry(sqlite3_stmt *stmt, int64_t id, DsRow *row);

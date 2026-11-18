@@ -6,15 +6,17 @@
 typedef struct {
     DsEntry entry;
     size_t path_length;
-    HANDLE find;
+    HANDLE find, metadata_parent;
     DsWinNode node;
     GBytes *cursor;
+    uint64_t checked_at_flush;
     bool observed;
 } Directory;
 
 typedef struct {
     DsEntry entry;
     WCHAR *path;
+    HANDLE metadata_parent;
     WIN32_FIND_DATAW found;
 } MetadataJob;
 
@@ -29,18 +31,21 @@ typedef struct {
     GPtrArray *exclude_paths;
     WCHAR *cache_path;
     WCHAR *path;
+    size_t path_capacity;
     GArray *directories;
     DsWinNode root;
-    size_t open_searches;
+    size_t directory_handles;
     int64_t last_id;
     int64_t batch_start;
     size_t batch_count;
+    uint64_t batches_flushed;
     DsEntry *batch;
     GThread *helper;
     GAsyncQueue *requests, *results;
     MetadataJob job;
     bool pending;
     bool ntfs;
+    bool relative_metadata;
     bool partial;
 } Walker;
 
@@ -51,10 +56,16 @@ static Directory *top(Walker *w)
 
 static void close_search(Walker *w, Directory *directory)
 {
-    if (directory->find == INVALID_HANDLE_VALUE) return;
-    FindClose(directory->find);
-    directory->find = INVALID_HANDLE_VALUE;
-    --w->open_searches;
+    if (directory->find != INVALID_HANDLE_VALUE) {
+        FindClose(directory->find);
+        directory->find = INVALID_HANDLE_VALUE;
+        --w->directory_handles;
+    }
+    if (directory->metadata_parent != INVALID_HANDLE_VALUE) {
+        CloseHandle(directory->metadata_parent);
+        directory->metadata_parent = INVALID_HANDLE_VALUE;
+        --w->directory_handles;
+    }
 }
 
 static void pop_directory(Walker *w)
@@ -72,6 +83,7 @@ static DsStatus flush(Walker *w)
     if (!w->batch_count) return DS_OK;
     const DsEntryBatch batch = {w->batch, w->batch_count};
     const DsStatus status = w->sink(&batch, w->sink_data, w->error);
+    if (status == DS_OK) ++w->batches_flushed;
     for (size_t i = 0; i < w->batch_count; ++i) ds_path_clear(&w->batch[i].name);
     w->batch_count = 0;
     return status;
@@ -88,6 +100,15 @@ static DsStatus emit(Walker *w, const DsEntry *entry)
     return DS_OK;
 }
 
+static void measure_leaf(Walker *w, HANDLE parent, const WCHAR *path,
+                         const WIN32_FIND_DATAW *found, DsEntry *entry)
+{
+    if (parent != INVALID_HANDLE_VALUE &&
+        ds_win_measure_ntfs_file(parent, &w->root, found, entry))
+        return;
+    ds_win_measure_file(w->file_ops, path, &w->root, found, entry);
+}
+
 static gpointer metadata_helper(void *data)
 {
     Walker *w = data;
@@ -95,7 +116,7 @@ static gpointer metadata_helper(void *data)
         void *request = g_async_queue_pop(w->requests);
         if (request == w) return NULL;
         MetadataJob *job = request;
-        ds_win_measure_file(w->file_ops, job->path, &w->root, &job->found, &job->entry);
+        measure_leaf(w, job->metadata_parent, job->path, &job->found, &job->entry);
         g_async_queue_push(w->results, job);
     }
 }
@@ -239,15 +260,10 @@ static DsStatus inspect_root(Walker *w)
 
 static void reserve_search(Walker *w)
 {
-    /* Two slots are available for the directory identity checks while opening
-     * a search. Suspend the oldest cursor, which resumes at its active child. */
-    if (w->open_searches < DS_DIR_HANDLES - 2) return;
-    for (guint i = 0; i + 1 < w->directories->len; ++i) {
-        Directory *directory = &g_array_index(w->directories, Directory, i);
-        if (directory->find == INVALID_HANDLE_VALUE) continue;
-        close_search(w, directory);
-        return;
-    }
+    /* Reserve slots for the new cursor and both identity checks. Suspending
+     * an ancestor releases its cursor and metadata handle together. */
+    for (guint i = 0; w->directory_handles > DS_DIR_HANDLES - 3 && i + 1 < w->directories->len; ++i)
+        close_search(w, &g_array_index(w->directories, Directory, i));
 }
 
 static DWORD compare_directory(const Walker *w, const DsWinNode *expected, const DsWinNode *actual)
@@ -258,6 +274,7 @@ static DWORD compare_directory(const Walker *w, const DsWinNode *expected, const
 
 static DWORD search_directory(Walker *w, Directory *directory, WIN32_FIND_DATAW *found)
 {
+    reserve_search(w);
     HANDLE before = INVALID_HANDLE_VALUE, after = INVALID_HANDLE_VALUE;
     DsWinNode first, second;
     DWORD error = open_directory(w->path, &before, &first);
@@ -272,7 +289,6 @@ static DWORD search_directory(Walker *w, Directory *directory, WIN32_FIND_DATAW 
     if (!error) {
         WCHAR *pattern = ds_win_join(w->path, L"*");
         if (pattern) {
-            reserve_search(w);
             directory->find = FindFirstFileExW(pattern, FindExInfoBasic, found,
                                                FindExSearchNameMatch, NULL, FIND_FIRST_EX_LARGE_FETCH);
             if (directory->find == INVALID_HANDLE_VALUE) {
@@ -283,7 +299,7 @@ static DWORD search_directory(Walker *w, Directory *directory, WIN32_FIND_DATAW 
                     error = directory->find == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
                 }
             }
-            if (directory->find != INVALID_HANDLE_VALUE) ++w->open_searches;
+            if (directory->find != INVALID_HANDLE_VALUE) ++w->directory_handles;
             g_free(pattern);
         } else {
             error = ERROR_FILENAME_EXCED_RANGE;
@@ -294,8 +310,19 @@ static DWORD search_directory(Walker *w, Directory *directory, WIN32_FIND_DATAW 
         if (!recheck) recheck = compare_directory(w, &first, &second);
         if (recheck)
             error = recheck == ERROR_FILE_NOT_FOUND ? ERROR_FILE_INVALID : recheck;
-        else
+        else {
             directory->node = first;
+            if (!error && w->relative_metadata && first.id_known && second.id_known) {
+                WCHAR filesystem[32];
+                if (GetVolumeInformationByHandleW(before, NULL, 0, NULL, NULL, NULL,
+                                                   filesystem, G_N_ELEMENTS(filesystem)) &&
+                    wcscmp(filesystem, L"NTFS") == 0) {
+                    directory->metadata_parent = before;
+                    before = INVALID_HANDLE_VALUE;
+                    ++w->directory_handles;
+                }
+            }
+        }
     }
     if (after != INVALID_HANDLE_VALUE) CloseHandle(after);
     if (before != INVALID_HANDLE_VALUE) CloseHandle(before);
@@ -344,6 +371,20 @@ static bool dot_entry(const WCHAR *name)
     return wcscmp(name, L".") == 0 || wcscmp(name, L"..") == 0;
 }
 
+static size_t extend_path(Walker *w, size_t parent, const WCHAR *leaf, size_t bytes)
+{
+    const bool separator = parent && w->path[parent - 1] != L'\\';
+    const size_t length = parent + separator + bytes / sizeof(WCHAR);
+    if (length >= DS_WIN_PATH_UNITS) return 0;
+    if (length >= w->path_capacity) {
+        w->path_capacity = MIN(DS_WIN_PATH_UNITS, MAX(w->path_capacity * 2, length + 1));
+        w->path = g_renew(WCHAR, w->path, w->path_capacity);
+    }
+    if (separator) w->path[parent] = L'\\';
+    memcpy(w->path + parent + separator, leaf, bytes + sizeof(WCHAR));
+    return length;
+}
+
 static DsStatus observe_child(Walker *w, Directory *directory, const WIN32_FIND_DATAW *found)
 {
     if (w->last_id == INT64_MAX) {
@@ -360,14 +401,15 @@ static DsStatus observe_child(Walker *w, Directory *directory, const WIN32_FIND_
         return pending == DS_OK ? status : pending;
     }
     ds_win_find_metadata(found, &entry);
-    WCHAR *child = NULL;
+    const size_t parent = directory->path_length;
+    size_t child_length = 0;
     if (entry.reason == DS_REASON_NONE) {
-        child = ds_win_join(w->path, found->cFileName);
-        if (!child) {
+        child_length = extend_path(w, parent, found->cFileName, bytes);
+        if (!child_length) {
             entry.reason = DS_REASON_LIMIT;
             entry.os_code = ERROR_FILENAME_EXCED_RANGE;
         } else {
-            entry.reason = path_policy(w, child, found);
+            entry.reason = path_policy(w, w->path, found);
         }
         if (entry.reason != DS_REASON_NONE) {
             entry.kind = DS_EXCLUDED;
@@ -377,14 +419,20 @@ static DsStatus observe_child(Walker *w, Directory *directory, const WIN32_FIND_
         } else if (entry.kind == DS_FILE) {
             if (w->pending && boundary_requested(w->control)) status = finish_metadata(w);
             if (status == DS_OK && w->helper && !w->pending) {
-                w->job = (MetadataJob){.entry = entry, .path = child, .found = *found};
+                /* The helper borrows the parent until collection. Navigation
+                 * and cursor eviction happen only after the job is drained. */
+                w->job = (MetadataJob){.entry = entry, .found = *found,
+                    .path = g_memdup2(w->path, (child_length + 1) * sizeof(WCHAR)),
+                    .metadata_parent = directory->metadata_parent};
+                w->path[parent] = 0;
                 w->pending = true;
                 g_async_queue_push(w->requests, &w->job);
                 return DS_OK;
             }
             /* The walker can measure an adjacent file alongside the helper.
              * Both calls finish before the next cursor step or pause. */
-            if (status == DS_OK) ds_win_measure_file(w->file_ops, child, &w->root, found, &entry);
+            if (status == DS_OK)
+                measure_leaf(w, directory->metadata_parent, w->path, found, &entry);
         }
     }
 
@@ -392,13 +440,12 @@ static DsStatus observe_child(Walker *w, Directory *directory, const WIN32_FIND_
     if (status == DS_OK) status = emit(w, &entry);
     if (status == DS_OK && entry.kind == DS_DIRECTORY) {
         directory->cursor = g_bytes_ref(entry.name.raw);
-        Directory frame = {.entry = entry, .path_length = wcslen(child), .find = INVALID_HANDLE_VALUE};
+        Directory frame = {.entry = entry, .path_length = child_length, .find = INVALID_HANDLE_VALUE,
+                           .metadata_parent = INVALID_HANDLE_VALUE};
         g_array_append_val(w->directories, frame);
-        g_free(w->path);
-        w->path = child;
     } else {
+        w->path[parent] = 0;
         ds_path_clear(&entry.name);
-        g_free(child);
     }
     return status;
 }
@@ -409,6 +456,7 @@ static DsStatus enumerate(Walker *w)
         .entry = {.id = ++w->last_id, .kind = DS_DIRECTORY, .logical = {0, DS_UNAVAILABLE},
                   .allocated = {0, DS_UNAVAILABLE}},
         .path_length = wcslen(w->path), .find = INVALID_HANDLE_VALUE, .node = w->root,
+        .metadata_parent = INVALID_HANDLE_VALUE,
         .observed = true,
     };
     DsStatus status = ds_path_new(DS_PATH_UTF16LE, NULL, 0, &root.entry.name, w->error);
@@ -431,24 +479,52 @@ static DsStatus enumerate(Walker *w)
         Directory *directory = top(w);
         WIN32_FIND_DATAW found;
         DWORD error = ERROR_SUCCESS;
+        bool checked_path = false;
         if (directory->find == INVALID_HANDLE_VALUE) {
             error = search_directory(w, directory, &found);
+            checked_path = true;
+            directory->checked_at_flush = w->batches_flushed;
             directory->observed = true;
             if (directory->cursor) {
                 status = resume_search(w, directory, &found, &error);
                 if (status != DS_OK) return status;
             }
         } else {
-            if (directory->cursor) error = check_return_path(w, directory);
+            if (directory->cursor || (directory->metadata_parent != INVALID_HANDLE_VALUE &&
+                                     directory->checked_at_flush != w->batches_flushed)) {
+                status = finish_metadata(w);
+                if (status != DS_OK) return status;
+                error = check_return_path(w, directory);
+                checked_path = true;
+                directory->checked_at_flush = w->batches_flushed;
+            }
             if (!error) error = next_entry(directory->find, &found);
         }
         g_clear_pointer(&directory->cursor, g_bytes_unref);
         if (!error && !dot_entry(found.cFileName)) {
-            status = observe_child(w, directory, &found);
-            continue;
+            /* A retained handle can outlive a rename. Check the selected
+             * path between delivered batches and before entering a child. */
+            if (!checked_path && directory->metadata_parent != INVALID_HANDLE_VALUE &&
+                (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                status = finish_metadata(w);
+                if (status != DS_OK) return status;
+                error = check_return_path(w, directory);
+                directory->checked_at_flush = w->batches_flushed;
+            }
+            if (!error) {
+                status = observe_child(w, directory, &found);
+                continue;
+            }
         }
         status = finish_metadata(w);
         if (status != DS_OK) return status;
+        if ((error == ERROR_NO_MORE_FILES || error == ERROR_FILE_NOT_FOUND) &&
+            directory->metadata_parent != INVALID_HANDLE_VALUE) {
+            /* The open cursor can outlive a rename. Keep its observations and
+             * report partial coverage if the selected directory path changed. */
+            const DWORD recheck = check_return_path(w, directory);
+            if (recheck) error = recheck;
+        }
         if (error == ERROR_NO_MORE_FILES || error == ERROR_FILE_NOT_FOUND) {
             pop_directory(w);
         } else if (error) {
@@ -480,6 +556,7 @@ DsStatus ds_win_walk_with_metadata_ops(const DsScanOptions *options, DsControl *
     if (!w.path)
         return ds_error(error, DS_INVALID, code, "Scan root requires an absolute Windows drive path");
 
+    w.path_capacity = wcslen(w.path) + 1;
     w.exclude_paths = g_ptr_array_new_with_free_func(g_free);
     w.directories = g_array_new(FALSE, FALSE, sizeof(Directory));
     w.batch = g_new(DsEntry, DS_BATCH_MAX);
@@ -496,6 +573,8 @@ DsStatus ds_win_walk_with_metadata_ops(const DsScanOptions *options, DsControl *
     else
         status = inspect_root(&w);
     if (status == DS_OK) {
+        w.relative_metadata = w.ntfs && w.root.id_known && file_ops == &ds_win_metadata_ops &&
+                              ds_win_prepare_ntfs_metadata();
         start_helper(&w);
         status = enumerate(&w);
     }

@@ -3,9 +3,6 @@
 #include <string.h>
 #include <wchar.h>
 
-/* Includes the prefix and terminating NUL. Native limits may be lower. */
-#define DS_WIN_PATH_UNITS 32767u
-
 static bool drive_letter(WCHAR ch)
 {
     return (ch >= L'A' && ch <= L'Z') || (ch >= L'a' && ch <= L'z');

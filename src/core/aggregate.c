@@ -3,32 +3,8 @@
 typedef struct {
     DsSize sizes[DS_METRIC_COUNT];
     int64_t unknown[DS_METRIC_COUNT];
-    int64_t representative, entries, files, unique_files;
+    int64_t entries, files, unique_files;
 } Aggregate;
-
-static int aggregate_file(sqlite3_stmt *entries, Aggregate *row)
-{
-    if (!ds_sql_read_size(entries, 2, &row->sizes[DS_LOGICAL]) ||
-        !ds_sql_read_size(entries, 4, &row->sizes[DS_ALLOCATED])) return SQLITE_CORRUPT;
-    row->files = 1;
-    row->representative = sqlite3_column_int64(entries, 6);
-    bool changed = sqlite3_column_int(entries, 7) != 0;
-    DsQuality rep_quality = sqlite3_column_int(entries, 8);
-    DsQuality own_quality = row->sizes[DS_ALLOCATED].quality;
-    DsSize unique = {0, DS_UNAVAILABLE};
-    if (changed) unique.quality = DS_CHANGED;
-    else if (own_quality != DS_KNOWN) unique.quality = own_quality;
-    else if (row->representative)
-        unique.quality = rep_quality;
-    if (row->representative == sqlite3_column_int64(entries, 0)) {
-        if (unique.quality == DS_KNOWN) unique.bytes = row->sizes[DS_ALLOCATED].bytes;
-        if (!changed) row->unique_files = 1;
-    }
-    row->sizes[DS_UNIQUE] = unique;
-    for (DsMetric metric = DS_LOGICAL; metric < DS_METRIC_COUNT; ++metric)
-        row->unknown[metric] = row->sizes[metric].quality != DS_KNOWN;
-    return SQLITE_OK;
-}
 
 static void add_size(DsSize *total, DsSize next)
 {
@@ -68,7 +44,7 @@ static int aggregate_directory(sqlite3_stmt *children, int64_t id, Aggregate *ro
     return rc == SQLITE_DONE ? SQLITE_OK : rc;
 }
 
-static int bind_aggregate(sqlite3_stmt *stmt, int64_t id, const Aggregate *row)
+static int bind_directory(sqlite3_stmt *stmt, int64_t id, const Aggregate *row)
 {
     sqlite3_reset(stmt);
     int rc = sqlite3_bind_int64(stmt, 2, id);
@@ -77,31 +53,90 @@ static int bind_aggregate(sqlite3_stmt *stmt, int64_t id, const Aggregate *row)
         rc = ds_sql_bind_size(stmt, column, row->sizes[metric]);
         if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, column + 2, row->unknown[metric]);
     }
-    if (rc == SQLITE_OK) rc = row->representative
-        ? sqlite3_bind_int64(stmt, 12, row->representative) : sqlite3_bind_null(stmt, 12);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, 13, row->entries);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, 14, row->files);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, 15, row->unique_files);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, 12, row->entries);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, 13, row->files);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, 14, row->unique_files);
     if (rc == SQLITE_OK) rc = ds_sql_step_done(stmt);
     return rc;
 }
 
-static int aggregate_entries(DsStore *store, int64_t generation, DsControl *control)
+static int aggregate_leaves(DsStore *store, int64_t generation, DsControl *control)
+{
+    sqlite3_stmt *bounds = NULL, *insert = NULL;
+    int rc = ds_sql_prepare(store, &bounds,
+        "SELECT max(id) FROM (SELECT id FROM entries WHERE id>?1 ORDER BY id LIMIT ?2)");
+    /* File sizes already use the required unsigned encoding. Validate their
+     * quality and encoding before copying. A missing row blocks publication. */
+    if (rc == SQLITE_OK) rc = ds_sql_prepare(store, &insert,
+        "WITH leaves AS (SELECT e.id,e.kind=2 AS file,"
+        " CASE WHEN e.kind=2 THEN e.logical END AS logical,"
+        " CASE WHEN e.kind=2 THEN e.logical_quality ELSE ?5 END AS logical_quality,"
+        " CASE WHEN e.kind=2 THEN e.allocated END AS allocated,"
+        " CASE WHEN e.kind=2 THEN e.allocated_quality ELSE ?5 END AS allocated_quality,"
+        " CASE WHEN e.kind<>2 THEN ?5 WHEN o.changed THEN ?6"
+        "      WHEN e.allocated_quality<>?4 THEN e.allocated_quality"
+        "      WHEN o.representative_id IS NULL THEN ?5"
+        "      WHEN o.representative_id=e.id THEN e.allocated_quality"
+        "      ELSE r.allocated_quality END AS unique_quality,"
+        " o.representative_id,COALESCE(o.representative_id=e.id AND NOT o.changed,0) AS unique_files"
+        " FROM entries e"
+        " LEFT JOIN file_objects o ON o.generation=?1 AND o.identity=e.identity AND e.kind=2"
+        " LEFT JOIN entries r ON r.id=NULLIF(o.representative_id,e.id)"
+        " WHERE e.id>?2 AND e.id<=?3 AND (e.kind IN (3,4,5) OR (e.kind=2 AND"
+        " ((e.logical_quality=?4 AND length(e.logical)=8) OR"
+        "  (e.logical_quality BETWEEN ?5 AND ?6 AND e.logical IS NULL)) AND"
+        " ((e.allocated_quality=?4 AND length(e.allocated)=8) OR"
+        "  (e.allocated_quality BETWEEN ?5 AND ?6 AND e.allocated IS NULL)))))"
+        " INSERT INTO aggregates SELECT ?1,id,logical,logical_quality,file AND logical_quality<>?4,"
+        " allocated,allocated_quality,file AND allocated_quality<>?4,"
+        " CASE WHEN unique_quality=?4 THEN"
+        "      CASE WHEN representative_id=id THEN allocated ELSE zeroblob(8) END END,"
+        " unique_quality,file AND unique_quality<>?4,representative_id,1,file,unique_files"
+        " FROM leaves ORDER BY id");
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(bounds, 2, DS_BATCH_MAX);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(insert, 1, generation);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(insert, 4, DS_KNOWN);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(insert, 5, DS_UNAVAILABLE);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(insert, 6, DS_CHANGED);
+
+    int64_t previous = 0;
+    while (rc == SQLITE_OK) {
+        sqlite3_reset(bounds);
+        rc = sqlite3_bind_int64(bounds, 1, previous);
+        if (rc != SQLITE_OK) break;
+        rc = sqlite3_step(bounds);
+        if (rc != SQLITE_ROW) break;
+        if (sqlite3_column_type(bounds, 0) == SQLITE_NULL) {
+            rc = SQLITE_OK;
+            break;
+        }
+        int64_t last = sqlite3_column_int64(bounds, 0);
+        sqlite3_reset(bounds);
+        sqlite3_reset(insert);
+        rc = sqlite3_bind_int64(insert, 2, previous);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(insert, 3, last);
+        if (rc == SQLITE_OK) rc = ds_sql_step_done(insert);
+        if (rc == SQLITE_OK && control && !ds_control_checkpoint(control)) rc = SQLITE_INTERRUPT;
+        if (rc == SQLITE_OK) rc = ds_store_check_budget(store, false);
+        previous = last;
+    }
+    sqlite3_finalize(insert);
+    sqlite3_finalize(bounds);
+    return rc;
+}
+
+static int aggregate_directories(DsStore *store, int64_t generation, DsControl *control)
 {
     sqlite3_stmt *entries = NULL, *children = NULL, *insert = NULL;
     int rc = ds_sql_prepare(store, &entries,
-        "SELECT e.id,e.kind,e.logical,e.logical_quality,e.allocated,e.allocated_quality,"
-        " o.representative_id,o.changed,r.allocated_quality FROM entries e"
-        " LEFT JOIN file_objects o ON o.generation=?1 AND o.identity=e.identity AND e.kind=2"
-        " LEFT JOIN entries r ON r.id=o.representative_id ORDER BY e.id DESC");
+        "SELECT id FROM entries WHERE kind=1 ORDER BY id DESC");
     if (rc == SQLITE_OK) rc = ds_sql_prepare(store, &children,
         "SELECT a.node_id,a.logical,a.logical_quality,a.logical_unknown,"
         " a.allocated,a.allocated_quality,a.allocated_unknown,a.unique_allocated,a.unique_quality,"
         " a.unique_unknown,a.entry_count,a.file_count,a.unique_file_count FROM entries e"
         " LEFT JOIN aggregates a ON a.generation=?1 AND a.node_id=e.id WHERE e.parent_id=?2");
     if (rc == SQLITE_OK) rc = ds_sql_prepare(store, &insert,
-        "INSERT INTO aggregates VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)");
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(entries, 1, generation);
+        "INSERT INTO aggregates VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,?12,?13,?14)");
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(children, 1, generation);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(insert, 1, generation);
 
@@ -114,19 +149,8 @@ static int aggregate_entries(DsStore *store, int64_t generation, DsControl *cont
         }
         int64_t id = sqlite3_column_int64(entries, 0);
         Aggregate row = {.entries = 1};
-        switch (sqlite3_column_int(entries, 1)) {
-        case DS_DIRECTORY: rc = aggregate_directory(children, id, &row); break;
-        case DS_FILE: rc = aggregate_file(entries, &row); break;
-        case DS_LINK:
-        case DS_SPECIAL:
-        case DS_EXCLUDED:
-            for (DsMetric metric = DS_LOGICAL; metric < DS_METRIC_COUNT; ++metric)
-                row.sizes[metric].quality = DS_UNAVAILABLE;
-            rc = SQLITE_OK;
-            break;
-        default: rc = SQLITE_CORRUPT; break;
-        }
-        if (rc == SQLITE_OK) rc = bind_aggregate(insert, id, &row);
+        rc = aggregate_directory(children, id, &row);
+        if (rc == SQLITE_OK) rc = bind_directory(insert, id, &row);
     }
     sqlite3_finalize(insert);
     sqlite3_finalize(children);
@@ -192,7 +216,8 @@ static DsStatus finalize(DsStore *store, int result, DsCoverage coverage,
     int64_t generation = 0;
     rc = start_generation(store, &generation);
     if (rc == SQLITE_OK) rc = ds_hardlinks_finalize(store, generation, control);
-    if (rc == SQLITE_OK) rc = aggregate_entries(store, generation, control);
+    if (rc == SQLITE_OK) rc = aggregate_leaves(store, generation, control);
+    if (rc == SQLITE_OK) rc = aggregate_directories(store, generation, control);
     if (rc == SQLITE_OK) rc = finish_generation(store, generation);
     if (control) sqlite3_progress_handler(store->db, 0, NULL, NULL);
     if (rc == SQLITE_OK && ds_sql_progress(control)) rc = SQLITE_INTERRUPT;
@@ -203,7 +228,7 @@ static DsStatus finalize(DsStore *store, int result, DsCoverage coverage,
         ds_sql_exec(store, "ROLLBACK");
         return status;
     }
-    ds_store_checkpoint(store);
+    ds_store_checkpoint(store, true);
     return DS_OK;
 }
 

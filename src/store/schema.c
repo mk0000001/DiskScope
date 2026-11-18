@@ -243,6 +243,18 @@ static int enable_wal(DsStore *store)
     return rc;
 }
 
+static int wal_committed(void *data, sqlite3 *db, const char *database, int frames)
+{
+    DsStore *store = data;
+    (void)db;
+    if (strcmp(database, "main") == 0) {
+        if (frames <= store->wal_frames)
+            store->wal_checkpoint_at = 0;
+        store->wal_frames = frames;
+    }
+    return SQLITE_OK;
+}
+
 DsStatus ds_store_open(const DsNativePath *path, DsStoreMode mode,
                        DsStore **out, DsError *error)
 {
@@ -291,7 +303,10 @@ DsStatus ds_store_open(const DsNativePath *path, DsStoreMode mode,
         int64_t page_size = 0;
         if (rc == SQLITE_OK) rc = scalar(store, "PRAGMA page_size", &page_size);
         if (rc == SQLITE_OK && (page_size < 512 || page_size > 65536)) rc = SQLITE_CORRUPT;
-        if (rc == SQLITE_OK) store->page_size = (uint64_t)page_size;
+        if (rc == SQLITE_OK) {
+            store->page_size = (uint64_t)page_size;
+            sqlite3_wal_hook(store->db, wal_committed, store);
+        }
     }
     if (rc == SQLITE_OK) rc = ds_query_register_functions(store);
     if (rc != SQLITE_OK) {

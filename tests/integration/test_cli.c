@@ -1,4 +1,6 @@
 #include "diskscope/ds_snapshot.h"
+#include "diskscope/ds_query.h"
+#include "diskscope/ds_retention.h"
 #include <gio/gio.h>
 #include <glib/gstdio.h>
 #ifdef G_OS_WIN32
@@ -65,6 +67,14 @@ static void scan(void)
     g_assert_cmpint(g_mkdir(root, 0700), ==, 0);
     g_assert_true(g_file_set_contents(file, "seventeen letters", 17, &error));
     g_assert_no_error(error);
+    enum { BULK_FILES = DS_BATCH_MAX * 2 + 3 };
+    g_autofree char *bulk = g_build_filename(root, "bulk", NULL);
+    g_assert_cmpint(g_mkdir(bulk, 0700), ==, 0);
+    for (unsigned i = 0; i < BULK_FILES; ++i) {
+        g_autofree char *name = g_strdup_printf("entry-%04u", i);
+        g_autofree char *child = g_build_filename(bulk, name, NULL);
+        g_assert_true(g_file_set_contents(child, "", 0, NULL));
+    }
     const char *args[] = {program, "scan", "--root", root, "--cache-dir", cache,
                           "--output", output, NULL};
     g_assert_cmpint(run(args), ==, 0);
@@ -74,9 +84,16 @@ static void scan(void)
     g_assert_cmpint(ds_snapshot_open(&path, &store, NULL, NULL), ==, DS_OK);
     DsStoreInfo info = {0};
     g_assert_cmpint(ds_store_info(store, &info, NULL), ==, DS_OK);
-    g_assert_true(info.entry_count == 2);
+    g_assert_cmpuint(info.entry_count, ==, BULK_FILES + 3);
+    g_assert_cmpint(info.commit_seq, >=, 3);
     g_assert_true(info.aggregation_complete);
     g_assert_cmpint(info.coverage, ==, DS_COVERAGE_COMPLETE);
+    DsPage *root_page = NULL;
+    g_assert_cmpint(ds_query_page(store, &(DsQuery){.limit = 1}, &root_page, NULL, NULL), ==, DS_OK);
+    g_assert_cmpuint(root_page->count, ==, 1);
+    g_assert_cmpuint(root_page->rows[0].file_count, ==, BULK_FILES + 1);
+    g_assert_cmpuint(root_page->rows[0].metrics[DS_LOGICAL].bytes, ==, 17);
+    ds_page_free(root_page);
     DsVolumeInfo volume;
     g_assert_cmpint(ds_store_volume(store, &volume, NULL), ==, DS_OK);
     g_assert_cmpint(volume.captured_at, >, 0);
@@ -91,6 +108,12 @@ static void scan(void)
     ds_path_clear(&path);
     g_unlink(output);
     g_unlink(file);
+    for (unsigned i = 0; i < BULK_FILES; ++i) {
+        g_autofree char *name = g_strdup_printf("entry-%04u", i);
+        g_autofree char *child = g_build_filename(bulk, name, NULL);
+        g_assert_cmpint(g_unlink(child), ==, 0);
+    }
+    g_assert_cmpint(g_rmdir(bulk), ==, 0);
     g_rmdir(root);
     GDir *scans = g_dir_open(cache, 0, NULL);
     if (scans) {
@@ -98,6 +121,24 @@ static void scan(void)
         while ((name = g_dir_read_name(scans))) {
             char *child = g_build_filename(cache, name, NULL);
             char *database = g_build_filename(child, "scan.sqlite", NULL);
+#ifdef G_OS_WIN32
+            g_autofree char *wal = g_strconcat(database, "-wal", NULL);
+            g_autofree char *shm = g_strconcat(database, "-shm", NULL);
+            GStatBuf journal;
+            g_assert_cmpint(g_stat(wal, &journal), ==, 0);
+            g_assert_cmpint(journal.st_size, >, 32);
+            g_assert_cmpint(ds_path_from_arg(database, &path, NULL), ==, DS_OK);
+            g_assert_cmpint(ds_store_open(&path, DS_STORE_READER, &store, NULL), ==, DS_OK);
+            g_assert_cmpint(ds_store_info(store, &info, NULL), ==, DS_OK);
+            g_assert_cmpuint(info.entry_count, ==, BULK_FILES + 3);
+            g_assert_true(info.aggregation_complete);
+            g_assert_cmpint(info.coverage, ==, DS_COVERAGE_COMPLETE);
+            ds_store_info_clear(&info);
+            ds_store_close(store);
+            ds_path_clear(&path);
+            g_unlink(wal);
+            g_unlink(shm);
+#endif
             g_unlink(database);
             char *log = g_build_filename(child, "diagnostics.txt", NULL);
             g_unlink(log);
@@ -105,6 +146,8 @@ static void scan(void)
             char *lock = g_build_filename(child, "scan.lock", NULL);
             g_unlink(lock);
             g_free(lock);
+            g_autofree char *marker = g_build_filename(child, DS_CACHE_OWNER_FILE, NULL);
+            g_unlink(marker);
             g_rmdir(child);
             g_free(database);
             g_free(child);

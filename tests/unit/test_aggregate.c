@@ -139,6 +139,91 @@ static void overflow(Fixture *f, const void *unused)
     ds_page_free(page);
 }
 
+static void mixed_leaf_metrics(Fixture *f, const void *unused)
+{
+    (void)unused;
+    DsEntry entries[] = {
+        make_entry(1, 0, DS_DIRECTORY, "", 0, 0, 0),
+        make_entry(2, 1, DS_FILE, "zero", 0, 0, 1),
+        make_entry(3, 1, DS_FILE, "aa", 10, 0, 2),
+        make_entry(4, 1, DS_FILE, "zz", 10, 4096, 2),
+        make_entry(5, 1, DS_FILE, "unknown", 0, 8, 0),
+        make_entry(6, 1, DS_FILE, "changed", 0, 16, 3),
+        make_entry(7, 1, DS_LINK, "link", 91, 92, 0),
+        make_entry(8, 1, DS_SPECIAL, "special", 93, 94, 0),
+        make_entry(9, 1, DS_EXCLUDED, "excluded", 95, 96, 0),
+        make_entry(1000, 1, DS_DIRECTORY, "nested", 0, 0, 0),
+        make_entry(INT64_MAX, 1000, DS_FILE, "last", 1, 1, 0),
+    };
+    entries[2].allocated.quality = DS_UNSUPPORTED;
+    entries[4].logical.quality = DS_UNAVAILABLE;
+    entries[5].logical.quality = DS_CHANGED;
+    append(f, entries, G_N_ELEMENTS(entries));
+    g_assert_cmpint(ds_finalize(f->store, NULL, NULL), ==, DS_OK);
+    DsPage *page = read_all(f);
+    g_assert_cmpuint(page->count, ==, G_N_ELEMENTS(entries));
+    DsRow *rows = page->rows;
+    g_assert_cmpuint(rows[0].entry_count, ==, 11);
+    g_assert_cmpuint(rows[0].file_count, ==, 6);
+    g_assert_cmpuint(rows[0].unique_file_count, ==, 2);
+    g_assert_cmpuint(rows[0].metrics[DS_LOGICAL].bytes, ==, 21);
+    g_assert_cmpuint(rows[0].metrics[DS_ALLOCATED].bytes, ==, 4121);
+    g_assert_cmpuint(rows[0].unknown[DS_LOGICAL], ==, 2);
+    g_assert_cmpuint(rows[0].unknown[DS_ALLOCATED], ==, 1);
+    g_assert_cmpuint(rows[0].unknown[DS_UNIQUE], ==, 5);
+    g_assert_cmpint(rows[1].metrics[DS_UNIQUE].quality, ==, DS_KNOWN);
+    g_assert_cmpuint(rows[1].metrics[DS_UNIQUE].bytes, ==, 0);
+    g_assert_cmpint(rows[2].metrics[DS_UNIQUE].quality, ==, DS_UNSUPPORTED);
+    g_assert_cmpint(rows[3].metrics[DS_UNIQUE].quality, ==, DS_UNSUPPORTED);
+    g_assert_cmpint(rows[3].representative_id, ==, 3);
+    g_assert_cmpint(rows[5].metrics[DS_UNIQUE].quality, ==, DS_CHANGED);
+    for (size_t i = 6; i <= 8; ++i) {
+        for (DsMetric metric = DS_LOGICAL; metric < DS_METRIC_COUNT; ++metric) {
+            g_assert_cmpint(rows[i].metrics[metric].quality, ==, DS_UNAVAILABLE);
+            g_assert_cmpuint(rows[i].unknown[metric], ==, 0);
+        }
+        g_assert_cmpuint(rows[i].file_count, ==, 0);
+    }
+    g_assert_cmpuint(rows[9].entry_count, ==, 2);
+    g_assert_cmpint(rows[10].entry.id, ==, INT64_MAX);
+    ds_page_free(page);
+}
+
+static void repeated_identity_across_batches(Fixture *f, const void *unused)
+{
+    (void)unused;
+    DsEntry first[DS_BATCH_MAX];
+    first[0] = make_entry(1, 0, DS_DIRECTORY, "", 0, 0, 0);
+    first[1] = make_entry(2, 1, DS_FILE, "link-race-z", 11, 4096, 1);
+    first[1].links = 1;
+    for (size_t i = 2; i < G_N_ELEMENTS(first); ++i) {
+        char name[32];
+        g_snprintf(name, sizeof name, "file-%u", (unsigned)i);
+        first[i] = make_entry((int64_t)i + 1, 1, DS_FILE, name, 1, 4096, 2);
+        ds_u64_encode(i, first[i].identity + 8);
+        first[i].links = 1;
+    }
+    append(f, first, G_N_ELEMENTS(first));
+
+    const int64_t rep = DS_BATCH_MAX + 1;
+    DsEntry alias = make_entry(rep, 1, DS_FILE, "link-race-a", 12, 4096, 1);
+    alias.links = 1;
+    append(f, &alias, 1);
+    g_assert_cmpint(ds_finalize(f->store, NULL, NULL), ==, DS_OK);
+
+    DsQuery query = {.parent_id = 1, .filter = "link-race-", .limit = 4};
+    DsPage *page = NULL;
+    g_assert_cmpint(ds_query_page(f->store, &query, &page, NULL, NULL), ==, DS_OK);
+    g_assert_cmpuint(page->count, ==, 2);
+    for (size_t i = 0; i < page->count; ++i) {
+        g_assert_cmpint(page->rows[i].representative_id, ==, rep);
+        g_assert_cmpint(page->rows[i].metrics[DS_UNIQUE].quality, ==, DS_CHANGED);
+        g_assert_cmpuint(page->rows[i].unknown[DS_UNIQUE], ==, 1);
+        g_assert_cmpuint(page->rows[i].unique_file_count, ==, 0);
+    }
+    ds_page_free(page);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -146,5 +231,8 @@ int main(int argc, char **argv)
     g_test_add("/aggregate/reverse-hardlinks", Fixture, GINT_TO_POINTER(1), setup, hardlinks, teardown);
     g_test_add("/aggregate/unknown-identity", Fixture, NULL, setup, unknown_and_conflicting_identity, teardown);
     g_test_add("/aggregate/overflow", Fixture, NULL, setup, overflow, teardown);
+    g_test_add("/aggregate/mixed-leaf-metrics", Fixture, NULL, setup, mixed_leaf_metrics, teardown);
+    g_test_add("/aggregate/repeated-identity-across-batches", Fixture, NULL,
+               setup, repeated_identity_across_batches, teardown);
     return g_test_run();
 }

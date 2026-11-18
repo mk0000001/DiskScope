@@ -29,6 +29,8 @@ void ds_session_request_pause(DsSession *);
 void ds_session_request_resume(DsSession *);
 void ds_session_request_cancel(DsSession *);
 void ds_session_event(DsSession *, DsSessionEvent *);
+/* Wait for the reconciled worker exit or a GLib monotonic deadline. */
+void ds_session_wait_exit(DsSession *, int64_t deadline);
 const DsNativePath *ds_session_db_path(const DsSession *);
 void ds_session_unref(DsSession *);
 

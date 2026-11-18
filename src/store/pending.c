@@ -12,7 +12,7 @@ DsStatus ds_store_pending_push(DsStore *store, int64_t id, DsError *error)
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, 1, id);
     if (rc == SQLITE_OK) rc = ds_sql_step_done(stmt);
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_OK) ds_store_checkpoint(store);
+    if (rc == SQLITE_OK) ds_store_checkpoint(store, false);
     return ds_sql_status(store, rc, error);
 }
 
@@ -34,6 +34,6 @@ DsStatus ds_store_pending_pop(DsStore *store, int64_t *id, DsError *error)
         rc = SQLITE_OK;
     }
     sqlite3_finalize(stmt);
-    if (rc == SQLITE_OK && *id) ds_store_checkpoint(store);
+    if (rc == SQLITE_OK && *id) ds_store_checkpoint(store, false);
     return ds_sql_status(store, rc, error);
 }

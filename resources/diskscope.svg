@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="case" x2="0" y2="1">
+      <stop stop-color="#263c70"/>
+      <stop offset="1" stop-color="#0f1939"/>
+    </linearGradient>
+    <linearGradient id="drive" x2="0" y2="1">
+      <stop stop-color="#c3d8f4"/>
+      <stop offset="1" stop-color="#7695c6"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="26" fill="url(#case)" stroke="#5874a5" stroke-width="2"/>
+  <path d="M35 23h58a9 9 0 0 1 7.6 4.2l10 15.6a9 9 0 0 1 1.4 4.8V93a12 12 0 0 1-12 12H28a12 12 0 0 1-12-12V47.6a9 9 0 0 1 1.4-4.8l10-15.6A9 9 0 0 1 35 23Z" fill="url(#drive)"/>
+  <rect x="23" y="30" width="82" height="51" rx="7" fill="#16274c"/>
+  <rect x="28" y="35" width="39" height="41" rx="3" fill="#67b9fe"/>
+  <rect x="72" y="35" width="28" height="22" rx="3" fill="#62e8cc"/>
+  <rect x="72" y="62" width="28" height="14" rx="3" fill="#929afe"/>
+  <rect x="25" y="88" width="78" height="11" rx="5.5" fill="#243862"/>
+  <rect x="33" y="92" width="24" height="3" rx="1.5" fill="#b9d4f5"/>
+  <circle cx="93" cy="93.5" r="3" fill="#62e8cc"/>
+</svg>

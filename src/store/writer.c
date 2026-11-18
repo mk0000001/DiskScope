@@ -10,6 +10,8 @@
 #include <sys/statvfs.h>
 #endif
 
+enum { DS_WAL_CHECKPOINT_FRAMES = 512, DS_WAL_TRUNCATE_FRAMES = 4096 };
+
 static uint64_t file_size(const char *path)
 {
     GStatBuf info;
@@ -90,6 +92,15 @@ static int check_free_space(const char *directory, uint64_t reserve)
 #endif
 }
 
+static void truncate_wal(DsStore *store)
+{
+    int rc = sqlite3_wal_checkpoint_v2(store->db, "main", SQLITE_CHECKPOINT_TRUNCATE, NULL, NULL);
+    if (rc == SQLITE_OK) {
+        store->wal_frames = 0;
+        store->wal_checkpoint_at = 0;
+    }
+}
+
 int ds_store_check_budget(DsStore *store, bool collecting)
 {
     uint64_t database = file_size(store->filename);
@@ -100,22 +111,96 @@ int ds_store_check_budget(DsStore *store, bool collecting)
         if (rc != SQLITE_OK) return rc;
     }
     uint64_t threshold = store->budget - DS_CACHE_END_RESERVE - (UINT64_C(64) << 10);
-    if (size >= threshold) return SQLITE_FULL;
-
     uint64_t reserve = collecting || !in_transaction ? DS_CACHE_FREE_RESERVE : DS_CACHE_END_RESERVE;
     char *parent = g_path_get_dirname(store->filename);
-    int rc = check_free_space(parent, reserve);
+    int rc = size >= threshold ? SQLITE_FULL : check_free_space(parent, reserve);
+    uint64_t checkpoint_margin = DS_WAL_CHECKPOINT_FRAMES * (store->page_size + 24);
+    if (!in_transaction && store->wal_frames &&
+        (rc == SQLITE_FULL || (rc == SQLITE_OK && threshold - size < checkpoint_margin))) {
+        uint64_t required = DS_CACHE_END_RESERVE;
+        if (project_commit(store, database, &required) == SQLITE_OK &&
+            check_free_space(parent, required) == SQLITE_OK) {
+            truncate_wal(store);
+            database = file_size(store->filename);
+            size = cache_size(store, database);
+            rc = size >= threshold ? SQLITE_FULL : check_free_space(parent, reserve);
+        }
+    }
     g_free(parent);
     return rc;
 }
 
-void ds_store_checkpoint(DsStore *store)
+#ifdef G_OS_WIN32
+static bool sync_cached_wal(DsStore *store)
 {
+    /* The sole cache writer owns this SQLite connection and its WAL handle. */
+    sqlite3_file *wal = NULL;
+    return sqlite3_file_control(store->db, "main", SQLITE_FCNTL_JOURNAL_POINTER, &wal) == SQLITE_OK &&
+           wal && wal->pMethods && wal->pMethods->xSync(wal, SQLITE_SYNC_NORMAL) == SQLITE_OK;
+}
+#endif
+
+void ds_store_checkpoint(DsStore *store, bool force)
+{
+    if (force && store->terminal_wal)
+        return;
+    bool due = store->wal_frames - store->wal_checkpoint_at >= DS_WAL_CHECKPOINT_FRAMES;
+#ifdef G_OS_WIN32
+    const bool managed = store->cache_directory != NULL;
+    const bool recycle = store->wal_frames >= DS_WAL_TRUNCATE_FRAMES;
+    if (managed && recycle && store->wal_checkpoint_at < DS_WAL_TRUNCATE_FRAMES)
+        due = true;
+#endif
+    if (!force && !due)
+        return;
+#ifdef G_OS_WIN32
+    /* Sync committed WAL at the usual interval and backfill at the recycle
+     * threshold or when a budget check requests space. */
+    if (!force && managed && !recycle && sync_cached_wal(store)) {
+        store->wal_checkpoint_at = store->wal_frames;
+        return;
+    }
+#endif
+#ifdef G_OS_WIN32
+    int prior_frames = -1, prior_checkpointed = -1;
+    bool prior_valid = managed &&
+        sqlite3_wal_checkpoint_v2(store->db, "main", SQLITE_CHECKPOINT_NOOP,
+                                  &prior_frames, &prior_checkpointed) == SQLITE_OK &&
+        prior_checkpointed >= 0 && prior_checkpointed <= prior_frames &&
+        prior_frames == store->wal_frames;
+#endif
     int wal_frames = 0, checkpointed = 0;
-    int rc = sqlite3_wal_checkpoint_v2(store->db, NULL, SQLITE_CHECKPOINT_PASSIVE,
+    int rc = sqlite3_wal_checkpoint_v2(store->db, "main", SQLITE_CHECKPOINT_PASSIVE,
                                        &wal_frames, &checkpointed);
-    if (rc == SQLITE_OK && wal_frames == checkpointed && wal_frames >= 4096)
-        sqlite3_wal_checkpoint_v2(store->db, NULL, SQLITE_CHECKPOINT_TRUNCATE, NULL, NULL);
+#ifdef G_OS_WIN32
+    /* Successful backfill progress syncs the complete stable WAL first, even
+     * when a pinned reader prevents finishing the checkpoint. The sole writer
+     * must observe the same log before and after that progress. No progress or
+     * uncertain counts still require the explicit WAL durability barrier. */
+    bool checkpoint_synced_wal = rc == SQLITE_OK && prior_valid &&
+        wal_frames == prior_frames && wal_frames == store->wal_frames &&
+        checkpointed > prior_checkpointed && checkpointed <= wal_frames;
+    if (managed && (rc != SQLITE_OK || wal_frames != checkpointed) &&
+        !checkpoint_synced_wal && !sync_cached_wal(store))
+        return;
+#endif
+    /* A pinned reader can prevent backfill. Wait for more frames before retrying. */
+    store->wal_checkpoint_at = store->wal_frames;
+    if (rc == SQLITE_OK && wal_frames == checkpointed && wal_frames >= DS_WAL_TRUNCATE_FRAMES)
+        truncate_wal(store);
+}
+
+DsStatus ds_store_prepare_terminal_wal(DsStore *store, DsError *error)
+{
+    if (!store || store->mode != DS_STORE_WRITER || !sqlite3_get_autocommit(store->db))
+        return ds_error(error, DS_INVALID, 0, "Terminal WAL requires an idle writable store");
+    /* FULL syncs the final transaction in the WAL before success. Readers and
+     * SQLite backup still see its committed pages without a second cache write. */
+    int rc = ds_sql_exec(store, "PRAGMA synchronous=FULL");
+    if (rc == SQLITE_OK)
+        rc = sqlite3_db_config(store->db, SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, 1, NULL);
+    if (rc == SQLITE_OK) store->terminal_wal = true;
+    return ds_sql_status(store, rc, error);
 }
 
 static void fingerprint_part(GChecksum *checksum, guchar tag, const void *data, size_t length)
@@ -246,15 +331,14 @@ static bool valid_entry(const DsEntry *e)
         ds_path_component_valid(e->name.encoding, name, length);
 }
 
-static int write_entry(DsStore *store, sqlite3_stmt *stmt, const DsEntry *e, int64_t seq,
-                       bool *inserted, DsError *error)
+static int insert_entry(DsStore *store, sqlite3_stmt *stmt, const DsEntry *e, int64_t seq,
+                        bool *inserted, DsError *error)
 {
     size_t length = 0;
     const void *raw = g_bytes_get_data(e->name.raw, &length);
     char *display = NULL;
     DsStatus status = ds_path_display(&e->name, &display, error);
     if (status != DS_OK) return SQLITE_MISMATCH;
-    sqlite3_reset(stmt);
     int rc = sqlite3_bind_int64(stmt, 1, e->id);
     if (rc == SQLITE_OK) rc = e->parent_id ? sqlite3_bind_int64(stmt, 2, e->parent_id)
                                           : sqlite3_bind_null(stmt, 2);
@@ -273,19 +357,39 @@ static int write_entry(DsStore *store, sqlite3_stmt *stmt, const DsEntry *e, int
     if (rc == SQLITE_OK) rc = e->mtime_known ? sqlite3_bind_int64(stmt, 15, e->mtime)
                                             : sqlite3_bind_null(stmt, 15);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, 16, seq);
-    if (rc == SQLITE_OK) {
-        rc = sqlite3_step(stmt);
-        if (rc == SQLITE_ROW) {
-            *inserted = sqlite3_column_int64(stmt, 0) == seq;
-            rc = ds_sql_step_done(stmt);
-        } else if (rc == SQLITE_DONE) {
-            rc = SQLITE_CONSTRAINT;
-        }
-    }
+    if (rc == SQLITE_OK) rc = ds_sql_step_done(stmt);
+    if (rc == SQLITE_OK) *inserted = sqlite3_changes(store->db) == 1;
     sqlite3_reset(stmt);
     sqlite3_clear_bindings(stmt);
     g_free(display);
-    (void)store;
+    return rc;
+}
+
+static int update_directory(DsStore *store, sqlite3_stmt **update, const DsEntry *e)
+{
+    if (e->kind != DS_DIRECTORY) return SQLITE_CONSTRAINT;
+    if (!*update) {
+        int rc = ds_sql_prepare(store, update,
+            "UPDATE entries SET reason=?5,os_code=?6"
+            " WHERE id=?1 AND kind=1 AND parent_id IS ?2 AND name=?3 AND name_encoding=?4"
+            " AND (?1=1 OR EXISTS(SELECT 1 FROM entries WHERE id=?2 AND kind=1))");
+        if (rc != SQLITE_OK) return rc;
+    }
+
+    size_t length = 0;
+    const void *raw = g_bytes_get_data(e->name.raw, &length);
+    sqlite3_stmt *stmt = *update;
+    int rc = sqlite3_bind_int64(stmt, 1, e->id);
+    if (rc == SQLITE_OK) rc = e->parent_id ? sqlite3_bind_int64(stmt, 2, e->parent_id)
+                                          : sqlite3_bind_null(stmt, 2);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_blob64(stmt, 3, length ? raw : "", length, SQLITE_STATIC);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(stmt, 4, e->name.encoding);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(stmt, 5, e->reason);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, 6, e->os_code);
+    if (rc == SQLITE_OK) rc = ds_sql_step_done(stmt);
+    if (rc == SQLITE_OK && sqlite3_changes(store->db) != 1) rc = SQLITE_CONSTRAINT;
+    sqlite3_reset(stmt);
+    sqlite3_clear_bindings(stmt);
     return rc;
 }
 
@@ -319,7 +423,7 @@ DsStatus ds_store_append(DsStore *store, const DsEntryBatch *batch, DsError *err
     if (rc == SQLITE_OK) rc = ds_sql_exec(store, "BEGIN IMMEDIATE");
     if (rc != SQLITE_OK) return ds_sql_status(store, rc, error);
 
-    sqlite3_stmt *metadata = NULL, *entry = NULL, *issue = NULL;
+    sqlite3_stmt *metadata = NULL, *entry = NULL, *update = NULL, *issue = NULL;
     rc = ds_sql_prepare(store, &metadata,
         "SELECT commit_seq,encoding FROM scans WHERE id=1 AND root_raw IS NOT NULL AND run_status=-1");
     int64_t seq = 0;
@@ -341,12 +445,7 @@ DsStatus ds_store_append(DsStore *store, const DsEntryBatch *batch, DsError *err
         " logical,logical_quality,allocated,allocated_quality,identity,links,mtime,commit_seq)"
         " SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16"
         " WHERE ?1=1 OR EXISTS(SELECT 1 FROM entries WHERE id=?2 AND kind=1)"
-        " ON CONFLICT(id) DO UPDATE SET reason=excluded.reason, os_code=excluded.os_code"
-        " WHERE entries.kind=1 AND excluded.kind=1 AND entries.parent_id IS excluded.parent_id"
-        " AND entries.name=excluded.name AND entries.name_encoding=excluded.name_encoding"
-        " RETURNING commit_seq");
-    if (rc == SQLITE_OK) rc = ds_sql_prepare(store, &issue,
-        "INSERT OR IGNORE INTO issues VALUES(?1,'observation',?2,?3,unixepoch())");
+        " ON CONFLICT(id) DO NOTHING");
     int64_t added = 0;
     for (size_t i = 0; rc == SQLITE_OK && i < batch->count; ++i) {
         const DsEntry *observation = &batch->entries[i];
@@ -355,12 +454,18 @@ DsStatus ds_store_append(DsStore *store, const DsEntryBatch *batch, DsError *err
             rc = SQLITE_MISMATCH;
             break;
         }
-        rc = write_entry(store, entry, observation, seq + 1, &inserted, error);
-        if (rc == SQLITE_OK && observation->reason != DS_REASON_NONE)
-            rc = record_issue(issue, observation);
+        rc = insert_entry(store, entry, observation, seq + 1, &inserted, error);
+        if (rc == SQLITE_OK && !inserted)
+            rc = update_directory(store, &update, observation);
+        if (rc == SQLITE_OK && observation->reason != DS_REASON_NONE) {
+            if (!issue) rc = ds_sql_prepare(store, &issue,
+                "INSERT OR IGNORE INTO issues VALUES(?1,'observation',?2,?3,unixepoch())");
+            if (rc == SQLITE_OK) rc = record_issue(issue, observation);
+        }
         added += inserted;
     }
     sqlite3_finalize(entry);
+    sqlite3_finalize(update);
     sqlite3_finalize(issue);
     if (rc == SQLITE_OK) rc = ds_sql_prepare(store, &metadata,
         "UPDATE scans SET commit_seq=?1,entry_count=entry_count+?2 WHERE id=1");
@@ -375,6 +480,6 @@ DsStatus ds_store_append(DsStore *store, const DsEntryBatch *batch, DsError *err
         ds_sql_exec(store, "ROLLBACK");
         return status;
     }
-    ds_store_checkpoint(store);
+    ds_store_checkpoint(store, false);
     return DS_OK;
 }

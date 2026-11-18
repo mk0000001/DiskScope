@@ -2,7 +2,11 @@ include(GNUInstallDirs)
 install(FILES LICENSE THIRD_PARTY_NOTICES DESTINATION ${CMAKE_INSTALL_DOCDIR})
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     if(DS_GUI)
-        install(FILES packaging/linux/diskscope.desktop DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/applications)
+        install(FILES packaging/linux/org.diskscope.Explorer.desktop
+                DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/applications)
+        install(FILES resources/diskscope.svg
+                DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/icons/hicolor/scalable/apps
+                RENAME org.diskscope.Explorer.svg)
     endif()
     set(CPACK_PACKAGE_NAME "diskscope")
     set(CPACK_PACKAGE_VENDOR "DiskScope contributors")
